@@ -1,4 +1,4 @@
-# streamlit_app.py — BJAM Recommender + Digital Twin (stable guardrails, diverse trials, fast twin)
+# streamlit_app.py — BJAM Recommender + Digital Twin (fixed guardrails, STL units, robust packing)
 from __future__ import annotations
 import io, math, importlib.util
 from pathlib import Path
@@ -22,7 +22,7 @@ if HAVE_SHAPELY:
     from shapely.ops import unary_union
     from shapely import wkb
 
-# project utils
+# project utils (unchanged from your repo)
 from shared import (
     load_dataset,
     train_green_density_models,
@@ -56,33 +56,37 @@ models, meta = train_green_density_models(df_base)
 
 # ---------------------- helpers -----------------------
 def safe_guardrails(d50_um: float, on: bool):
-    """
-    Robust wrapper: if guardrails() throws (e.g., bad dtype / None), fall back to priors.
-    Guarantees numeric floats in the expected keys.
-    """
+    """Robust guardrails; always returns sane numeric windows."""
     try:
         gr = guardrail_ranges(float(d50_um), on=bool(on))
-        # coerce to clean floats
-        out = {
-            "binder_saturation_pct": (float(gr["binder_saturation_pct"][0]),
-                                      float(gr["binder_saturation_pct"][1])),
-            "roller_speed_mm_s": (float(gr["roller_speed_mm_s"][0]),
-                                  float(gr["roller_speed_mm_s"][1])),
-            "layer_thickness_um": (float(gr["layer_thickness_um"][0]),
-                                   float(gr["layer_thickness_um"][1])),
-        }
-        return out
+        b0,b1 = [float(x) for x in gr["binder_saturation_pct"]]
+        v0,v1 = [float(x) for x in gr["roller_speed_mm_s"]]
+        t0,t1 = [float(x) for x in gr["layer_thickness_um"]]
     except Exception:
         pri = physics_priors(float(d50_um), binder_type_guess=None)
-        # loose but safe windows around priors
         b = float(np.clip(pri["binder_saturation_pct"], 55, 105))
         v = float(np.clip(pri["roller_speed_mm_s"], 0.6, 5.0))
         t = float(np.clip(pri["layer_thickness_um"], 2.0, 300.0))
-        return {
-            "binder_saturation_pct": (max(50.0, b-15.0), min(110.0, b+15.0)),
-            "roller_speed_mm_s": (max(0.5, v-1.0), min(5.0, v+1.0)),
-            "layer_thickness_um": (max(3.0, 0.6*t), min(300.0, 1.4*t)),
-        }
+        b0,b1 = b-15, b+15
+        v0,v1 = v-1.0, v+1.0
+        t0,t1 = 0.6*t, 1.4*t
+
+    # sanitize (slider requires min<max and reasonable span)
+    def _fix(a,b,eps):
+        a=float(a); b=float(b)
+        if not np.isfinite(a): a=0.0
+        if not np.isfinite(b): b=max(a+eps,eps)
+        if b <= a + eps: b = a + eps
+        return a,b
+    b0,b1 = _fix(b0,b1,1.0)
+    v0,v1 = _fix(v0,v1,0.05)
+    t0,t1 = _fix(t0,t1,1.0)
+
+    return {
+        "binder_saturation_pct": (max(40.0,b0), min(120.0,b1)),
+        "roller_speed_mm_s": (max(0.2,v0), min(6.0,v1)),
+        "layer_thickness_um": (max(2.0,t0), min(400.0,t1)),
+    }
 
 def binder_hex(name: str) -> str:
     s = (name or "").lower()
@@ -97,11 +101,9 @@ with st.sidebar:
     st.header("BJAM Controls")
     if src and len(df_base):
         st.success(f"Data: {Path(src).name} · rows={len(df_base):,}")
-        st.download_button(
-            "Download dataset (CSV)",
-            data=df_base.to_csv(index=False).encode("utf-8"),
-            file_name=Path(src).name, mime="text/csv"
-        )
+        st.download_button("Download dataset (CSV)",
+                           data=df_base.to_csv(index=False).encode("utf-8"),
+                           file_name=Path(src).name, mime="text/csv")
     else:
         st.warning("No dataset found; physics-only priors will be used.")
 
@@ -149,8 +151,10 @@ with left:
     gr = safe_guardrails(d50_um, on=guardrails_on)
 
     t_lo, t_hi = gr["layer_thickness_um"]
+    # clamp default inside the slider bounds
+    def_layer = float(np.clip(pri["layer_thickness_um"], t_lo, t_hi))
     layer_um = st.slider("Layer thickness (µm)", float(round(t_lo)), float(round(t_hi)),
-                         float(round(pri["layer_thickness_um"])), 1.0)
+                         float(round(def_layer)), 1.0)
 
     auto_binder = suggest_binder_family(material, material_class)
     binder_choice = st.selectbox("Binder family", [f"auto ({auto_binder})","solvent_based","water_based"])
@@ -180,19 +184,15 @@ diverse_pick = colR.toggle("Use diverse 3-water + 2-solvent", False,
                            help="Force binder % diversity and two solvent trials.")
 
 def dense_candidates(models, d50_um, layer_um, material, material_class, binder_family, gr, nx=55, ny=41):
-    b_lo,b_hi = gr["binder_saturation_pct"]; s_lo,s_hi = gr["roller_speed_mm_s"]
-    Xs = np.linspace(float(b_lo), float(b_hi), nx)
-    Ys = np.linspace(float(s_lo), float(s_hi), ny)
-    df = pd.DataFrame([(b,v,layer_um,d50_um,material) for b in Xs for v in Ys],
-                      columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
-    df["material_class"] = material_class
-    df["binder_type_rec"] = binder_family
-    pred = predict_quantiles(models, df)
-    out = df.reset_index(drop=True).join(pred[["td_q10","td_q50","td_q90"]].reset_index(drop=True))
-    return out
+    b_lo,b_hi=gr["binder_saturation_pct"]; s_lo,s_hi=gr["roller_speed_mm_s"]
+    Xs=np.linspace(float(b_lo),float(b_hi),nx); Ys=np.linspace(float(s_lo),float(s_hi),ny)
+    df=pd.DataFrame([(b,v,layer_um,d50_um,material) for b in Xs for v in Ys],
+                    columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
+    df["material_class"]=material_class; df["binder_type_rec"]=binder_family
+    pred=predict_quantiles(models, df)
+    return df.reset_index(drop=True).join(pred[["td_q10","td_q50","td_q90"]].reset_index(drop=True))
 
 def score_and_pick(df, target):
-    # primary score: hit q10 above target; then keep q50 close
     s = 3.0*np.clip(float(target)-df["td_q10"],0,None) + (df["td_q50"]-float(target)).abs()
     return df.assign(_score=s).sort_values("_score")
 
@@ -223,7 +223,6 @@ if btn:
         })
         st.session_state["top_recipes_df"]=recs.copy()
     else:
-        # 3 water + 2 solvent with diversity pressure
         recs_list=[]
         for fam, need in [("water_based",3),("solvent_based",2)]:
             cand = dense_candidates(models, float(d50_um), float(layer_um), material, material_class, fam, gr)
@@ -261,7 +260,7 @@ else:
 
 st.divider()
 
-# ---------------------- visuals ------------------------
+# ---------------------- visuals (unchanged) ------------------------
 tabs = st.tabs([
     "Heatmap (speed × saturation)",
     "Saturation sensitivity",
@@ -279,7 +278,6 @@ def grid_for_context(gr, layer_um, d50_um, material, material_class, binder_fami
     grid["material_class"]=material_class; grid["binder_type_rec"]=binder_family
     return grid, Xs, Ys
 
-# Heatmap
 with tabs[0]:
     st.subheader("Heatmap — Predicted green %TD (q50)")
     grid, Xs, Ys = grid_for_context(gr, layer_um, d50_um, material, material_class, binder_family)
@@ -294,7 +292,6 @@ with tabs[0]:
                       title=f"Layer={layer_um:.0f} µm · D50={d50_um:.0f} µm · {material} ({material_class}) · Source={Path(src).name if src else '—'}")
     st.plotly_chart(fig, use_container_width=True)
 
-# Sensitivity
 with tabs[1]:
     st.subheader("Saturation sensitivity (q10–q90)")
     sats = np.linspace(float(gr["binder_saturation_pct"][0]), float(gr["binder_saturation_pct"][1]), 61)
@@ -316,7 +313,6 @@ with tabs[1]:
     ax.grid(True, axis="y", alpha=0.18); ax.legend(frameon=False)
     st.pyplot(fig2, clear_figure=True)
 
-# Simple 2D packing toy (unchanged)
 with tabs[2]:
     st.subheader("Packing — 2D slice (toy)")
     c1,c2,c3,c4=st.columns(4)
@@ -344,7 +340,6 @@ with tabs[2]:
         att+=1
         if att>MAX: break
     rs=np.array([r for (_,_,r) in pts]); phi=(np.pi*np.sum(rs**2))/(W*W) if W>0 else 0.0
-    # draw
     xx=np.linspace(0,W,int(21*W)); yy=np.linspace(0,W,int(21*W)); X,Y=np.meshgrid(xx,yy)
     solid=np.zeros_like(X,dtype=bool)
     for (x,y,r) in pts: solid |= (X-x)**2+(Y-y)**2<=r**2
@@ -354,7 +349,6 @@ with tabs[2]:
     axA.set_xlim(0,W); axA.set_ylim(0,W); axA.set_xticks([]); axA.set_yticks([])
     st.pyplot(figA, clear_figure=True); st.caption(f"φ≈{phi*100:.1f}% • side≈{W*d50_um:.0f} µm")
 
-# Pareto
 with tabs[3]:
     st.subheader("Pareto frontier — Binder vs green %TD (q50)")
     gridP,_,_ = grid_for_context(gr, layer_um, d50_um, material, material_class, binder_family, nx=80, ny=1)
@@ -369,17 +363,16 @@ with tabs[3]:
                               mode="lines+markers",marker=dict(size=7,color="#111827"),
                               line=dict(width=2,color="#111827"),name="Pareto"))
     fig4.update_layout(xaxis_title="Binder saturation (%)", yaxis_title="Predicted green %TD (q50)",
-                       height=460, margin=dict(l=10,r=10,t=40,b=10))
+                       height=460, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig4, use_container_width=True)
 
-# Formulae
 with tabs[4]:
     st.subheader("Formulae (symbols)")
     st.latex(r"\%TD = \frac{\rho_{\mathrm{bulk}}}{\rho_{\mathrm{theoretical}}}\times 100\%")
     st.latex(r"3 \le \frac{t}{D_{50}} \le 5")
     st.latex(r"\phi = \frac{V_{\text{solids}}}{V_{\text{total}}}")
 
-# ---------------------- Digital Twin -------------------
+# ---------------------- Digital Twin (robust STL units + mesh preview) -------------------
 @st.cache_data(show_spinner=False)
 def _slice_polys_wkb(_mesh_key, z: float) -> Tuple[bytes, ...]:
     try:
@@ -424,31 +417,31 @@ def _crop_local(_polys_wkb: Tuple[bytes, ...], desired_fov: float | None):
 @st.cache_data(show_spinner=False)
 def _hex_pack_target(_key, polys_wkb: Tuple[bytes, ...], d50_unit: float,
                      phi_target: float, fov: float, cap: int, jitter: float):
-    """Hex packing scaled via small bisection so achieved φ≈target within ±0.03 (subject to cap & clip)."""
+    """Hex packing with adaptive radius to match φ_target; fallback reduces radius if erosion kills domain."""
     if not HAVE_SHAPELY or not polys_wkb: return np.empty((0,2)), np.empty((0,)), 0.0
     polys=[wkb.loads(p) for p in polys_wkb]; dom=unary_union(polys)
     if getattr(dom,"is_empty",True): return np.empty((0,2)), np.empty((0,)), 0.0
-    # bisection on radius scale factor k
-    r0=max(1e-9,d50_unit/2)
+
     def try_k(k: float):
-        r=r0*k
+        r=max(1e-12,d50_unit/2)*k
         s=2*r; dy=r*np.sqrt(3.0)
         xs=np.arange(r, fov-r, s); ys=np.arange(r, fov-r, dy)
-        pts=[]; 
+        if len(xs)==0 or len(ys)==0: return np.empty((0,2)), np.empty((0,)), 0.0
+        C=[]
         for j,yy in enumerate(ys):
             xoff=0.0 if (j%2==0) else r
             for xx in xs:
                 x0=xx+xoff
                 if x0>fov-r: continue
-                pts.append((x0,yy))
-        if not pts: return np.empty((0,2)), np.empty((0,)), 0.0
-        C=np.array(pts,float)
+                C.append((x0,yy))
+        C=np.array(C,float)
         if jitter>0:
             rng=np.random.default_rng(1234)
             C+=rng.uniform(-jitter*r, jitter*r, C.shape)
         try:
             fit=dom.buffer(-r)
-            if getattr(fit,"is_empty",True): return np.empty((0,2)), np.empty((0,)), 0.0
+            if getattr(fit,"is_empty",True):
+                return np.empty((0,2)), np.empty((0,)), 0.0
         except Exception:
             fit=dom
         keep=[i for i,(cx,cy) in enumerate(C)
@@ -459,17 +452,24 @@ def _hex_pack_target(_key, polys_wkb: Tuple[bytes, ...], d50_unit: float,
         phi=(float(np.sum(np.pi*R**2))/dom.area) if dom.area>0 else 0.0
         return C,R,phi
 
-    lo,hi=0.2, 2.0  # generous bounds
+    # bisection with fallback shrinking if needed
+    target=float(np.clip(phi_target,0.40,0.88))
+    lo,hi=0.2, 2.0
     bestC,bestR,bestPhi=np.empty((0,2)),np.empty((0,)),0.0
-    for _ in range(20):
+    for _ in range(22):
         mid=(lo+hi)/2
         C,R,phi=try_k(mid)
         if len(R)==0:
             hi=mid
             continue
         bestC,bestR,bestPhi=C,R,phi
-        if phi<phi_target: lo=mid
+        if phi<target: lo=mid
         else: hi=mid
+    # if still empty, force a smaller radius
+    if bestR.size==0:
+        for shrink in [0.15, 0.10, 0.07]:
+            C,R,phi=try_k(shrink)
+            if R.size>0: return C,R,phi
     return bestC,bestR,bestPhi
 
 @st.cache_data(show_spinner=False)
@@ -483,6 +483,7 @@ def _raster_solids(_key, centers: np.ndarray, radii: np.ndarray, fov: float, px:
 
 with tabs[5]:
     st.subheader("Digital Twin — STL slice + particle packing (auto φ)")
+
     if not (HAVE_TRIMESH and HAVE_SHAPELY):
         st.error("Please add 'trimesh' and 'shapely' to requirements.txt")
     else:
@@ -500,11 +501,24 @@ with tabs[5]:
             sat_pct_for_twin=st.slider("Binder saturation used for visualization (%)", 50, 100, 80, 1)
             layer_um_for_twin=layer_um; d50_um_for_twin=d50_um
 
-        c0,c1,c2,c3 = st.columns([2,1,1,1])
+        c0,c1,c2,c3,c4 = st.columns([2,1,1,1,1])
         with c0: stl=st.file_uploader("Upload STL", type=["stl"])
         with c1: use_cube=st.checkbox("Use 10 mm cube", value=(stl is None))
-        with c2: stl_units=st.selectbox("STL units", ["mm","m"], index=0)
-        with c3: precompute=st.checkbox("Precompute layer slices", value=False)
+        with c2:
+            stl_unit = st.selectbox("Model units", ["mm","m","inch","custom"], index=0,
+                                    help="Choose units used in the STL coordinates.")
+        with c3:
+            custom_mm_per_unit = st.number_input("Custom: mm per unit", 0.001, 10000.0, 1.0, 0.001,
+                                                 help="Only used if 'custom' is selected.")
+        with c4:
+            show_mesh = st.checkbox("Show 3D mesh preview", value=True)
+
+        # convert µm → model units
+        if stl_unit=="mm": um2unit = 1e-3
+        elif stl_unit=="m": um2unit = 1e-6
+        elif stl_unit=="inch": um2unit = (1.0/25.4)*1e-3
+        else:  # custom
+            um2unit = (1.0/custom_mm_per_unit) * 1e-3
 
         mesh=None
         if use_cube:
@@ -520,49 +534,50 @@ with tabs[5]:
             st.info("Upload an STL or select the sample cube.")
         else:
             st.session_state["_dtw_mesh"]=mesh
-            um2unit=1e-3 if stl_units=="mm" else 1e-6
             thickness=float(layer_um_for_twin)*um2unit
             d50_unit=float(d50_um_for_twin)*um2unit
+
             zmin,zmax=float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
             n_layers=max(1, int((zmax-zmin)/max(thickness,1e-12)))
-            st.caption(f"Layers: {n_layers} · Z span: {zmax-zmin:.3f} {stl_units}")
+            st.caption(f"Layers: {n_layers} · Z span: {zmax-zmin:.3f} {stl_unit}")
+
             lcol,rcol=st.columns([2,1])
             with lcol: layer_idx=st.slider("Layer index",1,n_layers,1)
-            with rcol: px_user=st.slider("Render resolution (px)", 300, 1200, 700, 50)
+            with rcol: px_user=st.slider("Render resolution (px)", 300, 1400, 800, 50)
+
+            if show_mesh:
+                figm = go.Figure(data=[go.Mesh3d(
+                    x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
+                    i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
+                    color="lightgray", opacity=0.55, flatshading=True, name="Part"
+                )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=0,b=0), height=320)
+                st.plotly_chart(figm, use_container_width=True)
+
             z=zmin+(layer_idx-0.5)*thickness
             mkey=hash((mesh.vertices.tobytes(), mesh.faces.tobytes()))
-
-            if precompute:
-                with st.spinner("Caching slices…"):
-                    for li in range(1,n_layers+1):
-                        _ = _slice_polys_wkb(mkey, zmin+(li-0.5)*thickness)
-                st.success("Slices cached.")
-
             polys_wkb=_slice_polys_wkb(mkey, z)
             if not polys_wkb:
-                st.warning("Empty slice at this layer.")
+                st.warning("Empty slice at this layer (try another layer or check units).")
             else:
-                # choose FOV from particle cap and target φ
+                # Determine target φ2D and auto FOV from particle cap and units
                 phi_TPD=0.90; phi2D_target=float(np.clip(0.90*phi_TPD, 0.40, 0.88))
-                auto_fov=st.checkbox("Auto FOV to hit φ target", True,
-                                     help="Matches field-of-view to particle cap so φ₂D≈target.")
-                cap=st.slider("Particle cap", 500, 12000, 1800, 100)
+                auto_fov=st.checkbox("Auto FOV to hit φ target", True)
+                cap=st.slider("Particle cap", 500, 20000, 2200, 100)
 
-                # bbox upper bound
                 polys_tmp=[wkb.loads(p) for p in polys_wkb]; dom_tmp=unary_union(polys_tmp)
                 bx0,by0,bx1,by1=dom_tmp.bounds; slice_side=float(max(bx1-bx0, by1-by0))
 
                 r0=max(1e-12, d50_unit/2.0)
-                # approximate auto FOV so cap is reasonable; refined by hex solver below
                 est_cell=np.pi*(r0**2)/phi2D_target
                 fov_auto=float(np.sqrt(max(cap*est_cell, 1e-9)))
-                desired_fov=float(np.clip(fov_auto, 50.0*d50_unit, slice_side)) if auto_fov else \
-                             st.slider("FOV (model units)", 0.2, max(0.25,slice_side), min(float(max(1.0,fov_auto)),slice_side), 0.05)
+                if auto_fov:
+                    desired_fov=float(np.clip(fov_auto, 30.0*d50_unit, slice_side))
+                else:
+                    desired_fov=st.slider("FOV (model units)", float(max(5.0*d50_unit, 0.2)), float(slice_side),
+                                          float(min(max(fov_auto, 10.0*d50_unit), slice_side)), 0.05)
 
                 local_wkb, origin, fov = _crop_local(polys_wkb, desired_fov)
-
-                # resolution guard: ≥6 px per D50
-                px_auto=int(np.ceil((fov/max(d50_unit,1e-12))*6.0)); px_eff=int(max(px_user, px_auto, 300))
+                px_auto=int(np.ceil((fov/max(d50_unit,1e-12))*6.0)); px_eff=int(max(px_user, px_auto, 400))
 
                 centers,radii,phi2D = _hex_pack_target(
                     (hash(local_wkb), round(d50_unit,9), round(phi2D_target,4), round(fov,6), cap),
@@ -596,7 +611,7 @@ with tabs[5]:
                     figB.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=False), height=420)
                     st.plotly_chart(figB, use_container_width=True)
 
-                st.caption(f"Layer {layer_idx}/{n_layers} · FOV={fov:.3f} {stl_units} · "
+                st.caption(f"Layer {layer_idx}/{n_layers} · FOV={fov:.3f} {stl_unit} · "
                            f"φ₂D(target)≈{phi2D_target:.2f} · φ₂D(achieved)≈{phi2D:.2f} · particles={len(radii)} · px={px_eff}")
 
 # ---------------------- diagnostics/footer ------------
