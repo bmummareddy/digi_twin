@@ -136,8 +136,12 @@ def to_local_cached(_polys_wkb_tuple, origin_xy):
 
 @st.cache_data(show_spinner="Packing particles...")
 def pack_in_domain_cached(_polys_wkb_tuple, _diam_hash, diam_units, phi2D_target, 
-                          max_particles, max_trials, seed):
-    """CACHED: Greedy particle packing - most expensive operation"""
+                          max_particles, max_trials, seed, _layer_idx=None):
+    """CACHED: Greedy particle packing - most expensive operation
+    
+    _layer_idx is explicitly included to ensure different layers get different packs
+    even if geometry is similar (e.g., cylindrical parts)
+    """
     if not _polys_wkb_tuple: return np.empty((0,2)), np.empty((0,)), 0.0
     
     polys = [wkb.loads(p) for p in _polys_wkb_tuple]
@@ -504,7 +508,7 @@ with tabs[3]:
         diam_hash = hash(diam_mm.tobytes())
         centers, radii, phi2D = pack_in_domain_cached(
             dom_wkb, diam_hash, diam_mm, phi2D_target,
-            max_particles=2600, max_trials=600_000, seed=1001
+            max_particles=2600, max_trials=600_000, seed=1001, _layer_idx=0
         )
 
         # Rasterize
@@ -656,11 +660,11 @@ with tabs[5]:
         polys_local_wkb = [dom.wkb]
         render_fov = 2*half
 
-    # Pack particles (CACHED)
+    # Pack particles (CACHED per layer)
     diam_hash = hash(diam_units.tobytes())
     centers, radii, phi2D = pack_in_domain_cached(
         tuple(polys_local_wkb), diam_hash, diam_units, phi2D_target,
-        max_particles=cap, max_trials=480_000, seed=20_000+layer_idx
+        max_particles=cap, max_trials=480_000, seed=20_000+layer_idx, _layer_idx=layer_idx
     )
 
     # Render helpers
@@ -725,7 +729,7 @@ with tabs[5]:
         axB.set_title(f"{binder} · Sat {int(sat_pct)}%", fontsize=10)
         st.pyplot(figB, use_container_width=True)
 
-    st.caption(f"⚡ FOV={render_fov:.2f}mm · φ2D(target)≈{phi2D_target:.2f} · φ2D(achieved)≈{min(phi2D,1.0):.2f} · {len(centers)} particles")
+    st.caption(f"⚡ **Layer {layer_idx}** · FOV={render_fov:.2f}mm · φ2D(target)≈{phi2D_target:.2f} · φ2D(achieved)≈{min(phi2D,1.0):.2f} · {len(centers)} particles")
 
     # Compare trials
     st.subheader("Compare trials")
