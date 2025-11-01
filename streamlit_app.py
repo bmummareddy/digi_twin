@@ -1,4 +1,4 @@
-# streamlit_app.py — BJAM Recommender + Digital Twin (fixed guardrails, STL units, robust packing)
+# streamlit_app.py — BJAM Recommender + Digital Twin (robust STL packing, guardrails hardened)
 from __future__ import annotations
 import io, math, importlib.util
 from pathlib import Path
@@ -13,16 +13,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# optional twin deps
+# Optional deps for Digital Twin
 HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
 HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
 if HAVE_TRIMESH: import trimesh
 if HAVE_SHAPELY:
-    from shapely.geometry import Polygon, box
+    from shapely.geometry import Polygon, Point, box
     from shapely.ops import unary_union
     from shapely import wkb
 
-# project utils (unchanged from your repo)
+# Project utilities
 from shared import (
     load_dataset,
     train_green_density_models,
@@ -33,30 +33,30 @@ from shared import (
     suggest_binder_family,
 )
 
-# ---------------------- UI setup ----------------------
+# ================= Page =================
 st.set_page_config(page_title="BJAM Predictions", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-:root { --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }
-.stApp { background:#FFFDF7 !important; }
+:root{--font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif}
+.stApp{background:#FFFDF7!important}
 html,body,[class*="css"]{font-family:var(--font)!important;color:#111827!important}
 .block-container{max-width:1200px}
 .kpi{background:#fff;border-radius:12px;padding:16px 18px;border:1px solid rgba(0,0,0,.06);box-shadow:0 1px 2px rgba(0,0,0,.03)}
 .kpi .kpi-label{font-weight:600}
 .kpi .kpi-value{font-weight:800;font-size:2.1rem}
 .kpi .kpi-unit{font-weight:700}
+.badge{display:inline-block;padding:.2rem .5rem;border:1px solid #ddd;border-radius:6px;background:#fff}
 .footer{margin:24px 0 6px;text-align:center}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------- data & models ------------------
+# ================= Data/Models =================
 df_base, src = load_dataset(".")
 models, meta = train_green_density_models(df_base)
 
-# ---------------------- helpers -----------------------
+# ================= Helpers =================
 def safe_guardrails(d50_um: float, on: bool):
-    """Robust guardrails; always returns sane numeric windows."""
     try:
         gr = guardrail_ranges(float(d50_um), on=bool(on))
         b0,b1 = [float(x) for x in gr["binder_saturation_pct"]]
@@ -71,17 +71,15 @@ def safe_guardrails(d50_um: float, on: bool):
         v0,v1 = v-1.0, v+1.0
         t0,t1 = 0.6*t, 1.4*t
 
-    # sanitize (slider requires min<max and reasonable span)
     def _fix(a,b,eps):
         a=float(a); b=float(b)
         if not np.isfinite(a): a=0.0
-        if not np.isfinite(b): b=max(a+eps,eps)
+        if not np.isfinite(b): b=a+eps
         if b <= a + eps: b = a + eps
         return a,b
     b0,b1 = _fix(b0,b1,1.0)
     v0,v1 = _fix(v0,v1,0.05)
     t0,t1 = _fix(t0,t1,1.0)
-
     return {
         "binder_saturation_pct": (max(40.0,b0), min(120.0,b1)),
         "roller_speed_mm_s": (max(0.2,v0), min(6.0,v1)),
@@ -96,7 +94,7 @@ def binder_hex(name: str) -> str:
     if "furan" in s: return "#F5C07A"
     return "#F4B942"
 
-# ---------------------- sidebar -----------------------
+# ================= Sidebar =================
 with st.sidebar:
     st.header("BJAM Controls")
     if src and len(df_base):
@@ -113,7 +111,7 @@ with st.sidebar:
     target_green = st.slider("Target green %TD", 80, 98, 90, 1)
     st.caption("Selector prefers q10 ≥ target for conservatism.")
 
-# ---------------------- header ------------------------
+# ================= Header =================
 st.title("BJAM — Binder-Jet AM Parameter Recommender")
 st.caption("Physics-guided + few-shot • Guardrails hardened • Digital Twin for STL slices")
 
@@ -123,7 +121,7 @@ with st.expander("Preview source data", expanded=False):
 
 st.divider()
 
-# ---------------------- inputs ------------------------
+# ================= Inputs =================
 left, right = st.columns([1.2, 1])
 
 with left:
@@ -151,7 +149,6 @@ with left:
     gr = safe_guardrails(d50_um, on=guardrails_on)
 
     t_lo, t_hi = gr["layer_thickness_um"]
-    # clamp default inside the slider bounds
     def_layer = float(np.clip(pri["layer_thickness_um"], t_lo, t_hi))
     layer_um = st.slider("Layer thickness (µm)", float(round(t_lo)), float(round(t_hi)),
                          float(round(def_layer)), 1.0)
@@ -176,7 +173,7 @@ with right:
 
 st.divider()
 
-# ---------------------- recommendations ----------------
+# ================= Recommendations =================
 st.subheader("Recommended parameters")
 colL, colR = st.columns([1,1])
 top_k = colL.slider("How many to show", 3, 8, 5, 1)
@@ -244,15 +241,7 @@ if btn:
             "layer_um":"Layer (µm)","predicted_%TD_q10":"q10 %TD","predicted_%TD_q50":"q50 %TD",
             "predicted_%TD_q90":"q90 %TD","meets_target_q10":f"Meets target (q10 ≥ {target_green}%)",
         })
-    st.dataframe(out, use_container_width=True,
-                 column_config={
-                     "Binder sat (%)": st.column_config.NumberColumn(format="%.1f"),
-                     "Speed (mm/s)": st.column_config.NumberColumn(format="%.2f"),
-                     "Layer (µm)": st.column_config.NumberColumn(format="%.0f"),
-                     "q10 %TD": st.column_config.NumberColumn(format="%.2f"),
-                     "q50 %TD": st.column_config.NumberColumn(format="%.2f"),
-                     "q90 %TD": st.column_config.NumberColumn(format="%.2f"),
-                 })
+    st.dataframe(out, use_container_width=True)
     st.download_button("Download recommendations (CSV)", data=out.to_csv(index=False).encode("utf-8"),
                        file_name="bjam_recommendations.csv", use_container_width=True, type="secondary")
 else:
@@ -260,7 +249,7 @@ else:
 
 st.divider()
 
-# ---------------------- visuals (unchanged) ------------------------
+# ================= Visuals (kept) =================
 tabs = st.tabs([
     "Heatmap (speed × saturation)",
     "Saturation sensitivity",
@@ -372,7 +361,7 @@ with tabs[4]:
     st.latex(r"3 \le \frac{t}{D_{50}} \le 5")
     st.latex(r"\phi = \frac{V_{\text{solids}}}{V_{\text{total}}}")
 
-# ---------------------- Digital Twin (robust STL units + mesh preview) -------------------
+# ================= Digital Twin (robust) =================
 @st.cache_data(show_spinner=False)
 def _slice_polys_wkb(_mesh_key, z: float) -> Tuple[bytes, ...]:
     try:
@@ -417,31 +406,44 @@ def _crop_local(_polys_wkb: Tuple[bytes, ...], desired_fov: float | None):
 @st.cache_data(show_spinner=False)
 def _hex_pack_target(_key, polys_wkb: Tuple[bytes, ...], d50_unit: float,
                      phi_target: float, fov: float, cap: int, jitter: float):
-    """Hex packing with adaptive radius to match φ_target; fallback reduces radius if erosion kills domain."""
-    if not HAVE_SHAPELY or not polys_wkb: return np.empty((0,2)), np.empty((0,)), 0.0
+    """
+    Robust packer:
+      • Stage 1: hex grid + erosion (true fit)
+      • Stage 2: center-in-domain (no erosion)
+      • Stage 3: compute radius from φ target, domain area, cap (guaranteed fill)
+    Returns: centers, radii, phi2D, stage_used (1/2/3)
+    """
+    if not HAVE_SHAPELY or not polys_wkb:
+        return np.empty((0,2)), np.empty((0,)), 0.0, 0
     polys=[wkb.loads(p) for p in polys_wkb]; dom=unary_union(polys)
-    if getattr(dom,"is_empty",True): return np.empty((0,2)), np.empty((0,)), 0.0
+    if getattr(dom,"is_empty",True):
+        return np.empty((0,2)), np.empty((0,)), 0.0, 0
 
-    def try_k(k: float):
-        r=max(1e-12,d50_unit/2)*k
-        s=2*r; dy=r*np.sqrt(3.0)
-        xs=np.arange(r, fov-r, s); ys=np.arange(r, fov-r, dy)
-        if len(xs)==0 or len(ys)==0: return np.empty((0,2)), np.empty((0,)), 0.0
-        C=[]
+    target=float(np.clip(phi_target,0.40,0.88))
+    area_dom=float(dom.area)
+    rng = np.random.default_rng(1234)
+
+    def _grid(radius):
+        s=2.0*radius; dy=radius*np.sqrt(3.0)
+        xs=np.arange(radius, fov-radius, s); ys=np.arange(radius, fov-radius, dy)
+        if len(xs)==0 or len(ys)==0: return np.empty((0,2))
+        pts=[]
         for j,yy in enumerate(ys):
-            xoff=0.0 if (j%2==0) else r
+            xoff=0.0 if (j%2==0) else radius
             for xx in xs:
                 x0=xx+xoff
-                if x0>fov-r: continue
-                C.append((x0,yy))
-        C=np.array(C,float)
-        if jitter>0:
-            rng=np.random.default_rng(1234)
-            C+=rng.uniform(-jitter*r, jitter*r, C.shape)
+                if x0>fov-radius: continue
+                pts.append((x0,yy))
+        return np.array(pts,float)
+
+    def _stage1_try(k):
+        r=max(1e-12, d50_unit/2.0)*k
+        C=_grid(r)
+        if C.size==0: return np.empty((0,2)), np.empty((0,)), 0.0
+        if jitter>0: C += rng.uniform(-jitter*r, jitter*r, C.shape)
         try:
             fit=dom.buffer(-r)
-            if getattr(fit,"is_empty",True):
-                return np.empty((0,2)), np.empty((0,)), 0.0
+            if getattr(fit,"is_empty",True): return np.empty((0,2)), np.empty((0,)), 0.0
         except Exception:
             fit=dom
         keep=[i for i,(cx,cy) in enumerate(C)
@@ -449,28 +451,51 @@ def _hex_pack_target(_key, polys_wkb: Tuple[bytes, ...], d50_unit: float,
         C=C[keep]
         if len(C)>cap: C=C[:cap]
         R=np.full(len(C), r, float)
-        phi=(float(np.sum(np.pi*R**2))/dom.area) if dom.area>0 else 0.0
+        phi=(float(np.sum(np.pi*R**2))/area_dom) if area_dom>0 else 0.0
         return C,R,phi
 
-    # bisection with fallback shrinking if needed
-    target=float(np.clip(phi_target,0.40,0.88))
-    lo,hi=0.2, 2.0
+    # Stage 1: bisection on k
     bestC,bestR,bestPhi=np.empty((0,2)),np.empty((0,)),0.0
-    for _ in range(22):
+    lo,hi=0.15,2.0
+    for _ in range(24):
         mid=(lo+hi)/2
-        C,R,phi=try_k(mid)
-        if len(R)==0:
-            hi=mid
-            continue
+        C,R,phi=_stage1_try(mid)
+        if R.size==0: hi=mid; continue
         bestC,bestR,bestPhi=C,R,phi
         if phi<target: lo=mid
         else: hi=mid
-    # if still empty, force a smaller radius
-    if bestR.size==0:
-        for shrink in [0.15, 0.10, 0.07]:
-            C,R,phi=try_k(shrink)
-            if R.size>0: return C,R,phi
-    return bestC,bestR,bestPhi
+    if bestR.size>0:
+        return bestC,bestR,bestPhi,1
+
+    # Stage 2: center-in-domain (no erosion)
+    r2=max(1e-12, d50_unit/2.0)*0.6  # smaller to encourage placement
+    C=_grid(r2)
+    if C.size>0:
+        if jitter>0: C += rng.uniform(-jitter*r2, jitter*r2, C.shape)
+        keep=[i for i,(cx,cy) in enumerate(C) if dom.contains(Point(cx,cy))]
+        C=C[keep]
+        if len(C)>cap: C=C[:cap]
+        R=np.full(len(C), r2, float)
+        phi=(float(np.sum(np.pi*R**2))/area_dom) if area_dom>0 else 0.0
+        if R.size>0:
+            return C,R,phi,2
+
+    # Stage 3: solve radius from φ target and cap ⇒ r = sqrt(target*Area/(N*pi))
+    N=max(1,int(cap))
+    r3=math.sqrt(max(target*area_dom/(N*math.pi), 1e-18))
+    # don’t exceed FOV/4 to avoid degenerate zeros on skinny slices
+    r3=min(r3, 0.25*max(1e-12,fov))
+    C=_grid(r3)
+    if C.size==0:
+        # final minimal sprinkle
+        C = rng.uniform(r3, fov-r3, size=(min(N, max(64,int(0.15*cap))),2))
+    if jitter>0: C += rng.uniform(-jitter*r3, jitter*r3, C.shape)
+    keep=[i for i,(cx,cy) in enumerate(C) if dom.contains(Point(cx,cy))]
+    C=C[keep]
+    if len(C)>cap: C=C[:cap]
+    R=np.full(len(C), r3, float)
+    phi=(float(np.sum(np.pi*R**2))/area_dom) if area_dom>0 else 0.0
+    return C,R,phi,3
 
 @st.cache_data(show_spinner=False)
 def _raster_solids(_key, centers: np.ndarray, radii: np.ndarray, fov: float, px: int):
@@ -482,7 +507,7 @@ def _raster_solids(_key, centers: np.ndarray, radii: np.ndarray, fov: float, px:
     return mask
 
 with tabs[5]:
-    st.subheader("Digital Twin — STL slice + particle packing (auto φ)")
+    st.subheader("Digital Twin — STL slice + particle packing (robust)")
 
     if not (HAVE_TRIMESH and HAVE_SHAPELY):
         st.error("Please add 'trimesh' and 'shapely' to requirements.txt")
@@ -498,27 +523,23 @@ with tabs[5]:
             d50_um_for_twin=float(row.get("d50_um", d50_um))
         else:
             binder_for_twin=binder_family
-            sat_pct_for_twin=st.slider("Binder saturation used for visualization (%)", 50, 100, 80, 1)
+            sat_pct_for_twin=st.slider("Binder saturation for visualization (%)", 50, 100, 80, 1)
             layer_um_for_twin=layer_um; d50_um_for_twin=d50_um
 
         c0,c1,c2,c3,c4 = st.columns([2,1,1,1,1])
         with c0: stl=st.file_uploader("Upload STL", type=["stl"])
         with c1: use_cube=st.checkbox("Use 10 mm cube", value=(stl is None))
         with c2:
-            stl_unit = st.selectbox("Model units", ["mm","m","inch","custom"], index=0,
-                                    help="Choose units used in the STL coordinates.")
+            stl_unit = st.selectbox("Model units", ["mm","m","inch","custom"], index=0)
         with c3:
-            custom_mm_per_unit = st.number_input("Custom: mm per unit", 0.001, 10000.0, 1.0, 0.001,
-                                                 help="Only used if 'custom' is selected.")
+            custom_mm_per_unit = st.number_input("Custom: mm per unit", 0.001, 10000.0, 1.0, 0.001)
         with c4:
             show_mesh = st.checkbox("Show 3D mesh preview", value=True)
 
-        # convert µm → model units
         if stl_unit=="mm": um2unit = 1e-3
         elif stl_unit=="m": um2unit = 1e-6
         elif stl_unit=="inch": um2unit = (1.0/25.4)*1e-3
-        else:  # custom
-            um2unit = (1.0/custom_mm_per_unit) * 1e-3
+        else: um2unit = (1.0/custom_mm_per_unit) * 1e-3
 
         mesh=None
         if use_cube:
@@ -557,9 +578,9 @@ with tabs[5]:
             mkey=hash((mesh.vertices.tobytes(), mesh.faces.tobytes()))
             polys_wkb=_slice_polys_wkb(mkey, z)
             if not polys_wkb:
-                st.warning("Empty slice at this layer (try another layer or check units).")
+                st.warning("Empty slice at this layer (try another layer or adjust units).")
             else:
-                # Determine target φ2D and auto FOV from particle cap and units
+                # target φ2D and auto FOV
                 phi_TPD=0.90; phi2D_target=float(np.clip(0.90*phi_TPD, 0.40, 0.88))
                 auto_fov=st.checkbox("Auto FOV to hit φ target", True)
                 cap=st.slider("Particle cap", 500, 20000, 2200, 100)
@@ -571,7 +592,7 @@ with tabs[5]:
                 est_cell=np.pi*(r0**2)/phi2D_target
                 fov_auto=float(np.sqrt(max(cap*est_cell, 1e-9)))
                 if auto_fov:
-                    desired_fov=float(np.clip(fov_auto, 30.0*d50_unit, slice_side))
+                    desired_fov=float(np.clip(fov_auto, 20.0*d50_unit, slice_side))
                 else:
                     desired_fov=st.slider("FOV (model units)", float(max(5.0*d50_unit, 0.2)), float(slice_side),
                                           float(min(max(fov_auto, 10.0*d50_unit), slice_side)), 0.05)
@@ -579,7 +600,7 @@ with tabs[5]:
                 local_wkb, origin, fov = _crop_local(polys_wkb, desired_fov)
                 px_auto=int(np.ceil((fov/max(d50_unit,1e-12))*6.0)); px_eff=int(max(px_user, px_auto, 400))
 
-                centers,radii,phi2D = _hex_pack_target(
+                centers,radii,phi2D,stage = _hex_pack_target(
                     (hash(local_wkb), round(d50_unit,9), round(phi2D_target,4), round(fov,6), cap),
                     local_wkb, d50_unit, phi2D_target, fov, cap, jitter=0.12
                 )
@@ -594,6 +615,7 @@ with tabs[5]:
                     choose=rng.choice(pore_idx, size=min(k,len(pore_idx)), replace=False)
                     voids.ravel()[choose]=True
 
+                # Render
                 img_particles=np.ones((px_eff,px_eff,3),float); img_particles[solids]=np.array([0.18,0.38,0.96])
                 b_rgb=tuple(int(binder_hex(binder_for_twin)[i:i+2],16)/255.0 for i in (1,3,5))
                 img_layer=np.ones((px_eff,px_eff,3),float); img_layer[:]=b_rgb
@@ -611,10 +633,15 @@ with tabs[5]:
                     figB.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=False), height=420)
                     st.plotly_chart(figB, use_container_width=True)
 
-                st.caption(f"Layer {layer_idx}/{n_layers} · FOV={fov:.3f} {stl_unit} · "
-                           f"φ₂D(target)≈{phi2D_target:.2f} · φ₂D(achieved)≈{phi2D:.2f} · particles={len(radii)} · px={px_eff}")
+                reason = {1:"fit (eroded)", 2:"center-in-domain", 3:"radius-from-φ"}
+                st.caption(
+                    f"<span class='badge'>Layer {layer_idx}/{n_layers} • FOV={fov:.3f} {stl_unit} • "
+                    f"d50={d50_unit:.5g} {stl_unit} • φ₂D(target)≈{phi2D_target:.2f} • "
+                    f"φ₂D(achieved)≈{phi2D:.2f} • particles={len(radii)} • pack={reason.get(stage,'—')}</span>",
+                    unsafe_allow_html=True
+                )
 
-# ---------------------- diagnostics/footer ------------
+# ================= Footer =================
 with st.expander("Diagnostics", expanded=False):
     st.write("Guardrails on:", guardrails_on)
     st.write("Source file:", src or "—")
@@ -623,7 +650,7 @@ with st.expander("Diagnostics", expanded=False):
 
 st.markdown(f"""
 <div class="footer">
-  <strong>© {datetime.now().year} Bhargavi Mummareddy</strong> •
+  <strong>© {datetime.now().year} Bhargavi Mummareddy</strong> ·
   <a href="mailto:mummareddybhargavi@gmail.com">mummareddybhargavi@gmail.com</a>
 </div>
 """, unsafe_allow_html=True)
