@@ -466,7 +466,6 @@ st.markdown(f"""
 <a href="mailto:mummareddybhargavi@gmail.com">mummareddybhargavi@gmail.com</a><br/>
 </div>
 """, unsafe_allow_html=True)
- digital_twin_tab.py
 import io
 import numpy as np
 import plotly.graph_objects as go
