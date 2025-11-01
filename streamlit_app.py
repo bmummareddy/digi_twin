@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # BJAM — Binder-Jet AM Parameter Recommender + Digital Twin (Beta)
-# Uses your shared.py models. Visuals & packing refined for readability and stability.
+# Relies on your existing shared.py for data/model logic.
 
 from __future__ import annotations
 import io, os, math, importlib.util
@@ -32,7 +32,7 @@ st.markdown("""
 # ------------------------------- Optional geometry deps -----------------------
 HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
 HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
-HAVE_SCIPY   = importlib.util.find_spec("scipy") is not None
+HAVE_SCIPY   = importlib.util.find_spec("scipy")   is not None
 if HAVE_TRIMESH: import trimesh  # type: ignore
 if HAVE_SHAPELY:
     from shapely.geometry import Polygon, Point, box  # type: ignore
@@ -91,8 +91,7 @@ def crop_fov(polys, fov):
     return [g for g in res.geoms if isinstance(g, Polygon) and g.is_valid and g.area>1e-8]
 
 def pack_in_domain(polys, diam_units, phi2D_target, max_particles, max_trials, seed):
-    """Greedy circle packing; each circle must fit entirely inside domain.
-       Uses shapely erosion (buffer -r) to ensure full fit; spatial hashing avoids O(n^2)."""
+    """Greedy circle packing; each circle must fit entirely inside domain (erode by r)."""
     if not HAVE_SHAPELY:
         raise RuntimeError("This view requires 'shapely'. Please add it to requirements.txt.")
     if not polys: return np.empty((0,2)), np.empty((0,)), 0.0
@@ -269,7 +268,7 @@ with tab_pred:
         st.dataframe(recs, use_container_width=True, hide_index=True)
 
 # ==============================================================================
-# Heatmap (journal-ready styling)
+# Heatmap (journal-style)
 # ==============================================================================
 with tab_heat:
     st.subheader("Predicted green %TD (q50) — speed × saturation")
@@ -430,8 +429,9 @@ with tab_twin:
     with right:
         stl_units = st.selectbox("STL units", ["mm","m"], index=0)
         um2unit = 1e-3 if stl_units=="mm" else 1e-6
-        min_fov_mm = max(0.20, 0.02 * d50_um)   # ~20×D50 baseline
-        default_fov = max(0.80, 0.02 * d50_um)  # nicer default
+        # FOV tied to D50 so the view contains many particles
+        min_fov_mm = max(0.20, 0.02 * d50_um)
+        default_fov = max(0.80, 0.02 * d50_um)
         fov_mm = st.slider("Field of view (mm)", float(min_fov_mm), 3.0, float(default_fov), 0.05)
         phi_TPD = st.slider("Target φ_TPD", 0.85, 0.95, 0.90, 0.01)
         phi2D_target = float(np.clip(0.90*phi_TPD, 0.40, 0.88))
