@@ -470,12 +470,7 @@ st.markdown(f"""
 # Lightweight, fast Digital Twin tab that ONLY consumes existing Top-5 trials from the original app.
 # No re-training, no new predictions—keeps your current app's behavior intact.
 
-from __future__ import annotations
-import io, math, importlib.util
 from typing import List, Tuple, Optional, Dict
-
-import numpy as np
-import streamlit as st
 import plotly.graph_objects as go
 
 # Optional deps
