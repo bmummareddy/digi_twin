@@ -11,3 +11,4 @@ shapely==2.0.4
 networkx==3.2.1   # trimesh dependency
 scipy>=1.11   # optional; enables more organic void fields
 pyglet>=1.5.29
+Pillow>=10.0
