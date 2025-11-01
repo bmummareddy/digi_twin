@@ -1,0 +1,69 @@
+material,material_class,d50_um,layer_thickness_um,roller_speed_mm_s,binder_saturation_pct,binder_type_rec,final_density_pct,final_density_state
+420 Stainless Steel,metal,35.0,140.0,2.0,100.0,water_based,55.0,green
+Barium Titanate,ceramic,1.15,30.0,1.6,60.0,water_based,65.2,sintered
+Alumina,ceramic,1.7,50.0,1.6,55.0,water_based,60.0,green
+Alumina,ceramic,9.0,50.0,1.6,70.0,water_based,75.4,sintered
+Silk Powder,polymer,5.0,125.0,1.6,85.0,water_based,,
+Silk Powder,polymer,20.0,125.0,1.6,85.0,water_based,,
+Alumina,ceramic,5.0,100.0,1.6,90.0,water_based,72.0,sintered
+AlN,other,45.0,180.0,0.3333333333333333,200.0,water_based,60.1,sintered
+420 Stainless Steel,metal,35.0,140.0,1.6,100.0,water_based,55.0,green
+WC-Co,carbide,15.0,50.0,1.6,80.0,polymer_based,97.0,sintered
+Co-Cr Alloy,metal,20.0,30.0,1.6,70.0,polymer_based,,sintered
+W-Ni-Fe,other,20.0,70.0,1.6,100.0,polymer_based,95.0,sintered
+Titanium Aluminide,metal,45.0,50.0,1.6,85.0,water_based,,sintered
+Silicon Carbide,carbide,10.0,100.0,1.6,75.0,polymer_based,88.0,sintered
+Copper,metal,50.0,150.0,1.6,65.0,water_based,30.0,green
+316L Stainless Steel,metal,10.0,50.0,1.6,85.0,polymer_based,96.0,sintered
+316L Stainless Steel,metal,5.0,70.0,1.6,100.0,water_based,58.0,green
+Cobalt-Chromium Alloy,metal,20.0,30.0,1.6,75.0,polymer_based,,sintered
+Silicon Nitride,carbide,0.5,100.0,1.6,60.0,water_based,40.0,green
+316L Stainless Steel,metal,6.0,50.0,1.6,90.0,water_based,85.0,sintered
+Iron-Manganese-Calcium-Magnesium Alloy,metal,25.0,70.0,1.6,70.0,polymer_based,92.0,sintered
+Neodymium-Iron-Boron,metal,45.0,100.0,1.6,65.0,polymer_based,,green
+Hydroxyapatite,ceramic,2.0,50.0,1.6,80.0,water_based,35.0,green
+Beta-Tricalcium Phosphate,ceramic,1.0,40.0,1.6,85.0,water_based,33.0,green
+Alumina (Aluminum Oxide),metal,5.0,70.0,1.6,80.0,water_based,85.0,sintered
+Zirconia (Zirconium Dioxide),ceramic,0.5,50.0,1.6,75.0,water_based,55.0,green
+Silicon Carbide,carbide,10.0,100.0,1.6,65.0,polymer_based,88.0,sintered
+Gypsum,ceramic,50.0,150.0,1.6,90.0,water_based,,green
+Magnesium Aluminate Spinel,metal,8.0,75.0,1.6,70.0,polymer_based,57.0,green
+Stainless Steel 316L,metal,15.0,50.0,1.6,85.0,water_based,95.0,sintered
+Titanium Alloy (Ti-6Al-4V),metal,20.0,70.0,1.6,80.0,polymer_based,94.0,sintered
+Nickel-Chromium Alloy (Inconel 625),metal,25.0,70.0,1.6,70.0,polymer_based,96.0,sintered
+Paracetamol Powder,other,150.0,200.0,1.6,85.0,water_based,40.0,green
+Copper,metal,5.0,50.0,1.6,90.0,water_based,62.0,green
+Stainless Steel 316L,metal,30.0,50.0,1.6,70.0,water_based,94.0,sintered
+Nickel-based Superalloy (Alloy 625),metal,20.0,70.0,1.6,75.0,polymer_based,96.0,sintered
+Tungsten Carbide – Cobalt,metal,3.0,100.0,1.6,85.0,polymer_based,58.0,green
+Nickel-based Superalloy (Alloy 625),metal,30.0,70.0,1.6,70.0,polymer_based,97.0,sintered
+Barium Titanate (BaTiO₃),ceramic,0.8,50.0,1.6,65.0,water_based,54.0,green
+Aluminum Matrix Composite (Al + SiC),metal,20.0,100.0,1.6,80.0,polymer_based,92.0,sintered
+Aluminum Alloy (AlSi10Mg),metal,45.0,70.0,1.6,75.0,polymer_based,56.0,green
+Silicon Carbide (SiC),carbide,7.5,75.0,1.6,70.0,water_based,60.0,green
+Alumina (Al₂O₃),ceramic,0.75,50.0,1.6,80.0,water_based,57.0,green
+Inconel 718 (Nickel-based superalloy),metal,7.0,28.0,1.6,80.0,water_based,99.9,sintered
+Inconel 718 (Nickel-based superalloy),metal,21.0,84.0,1.6,80.0,water_based,99.9,sintered
+Inconel 718 (Nickel-based superalloy),metal,70.0,280.0,1.6,70.0,water_based,99.9,sintered
+IPS InLine Dentin (Dental porcelain ceramic),ceramic,20.0,80.0,2.0,50.0,water_based,40.0,green
+IPS InLine Dentin (Dental porcelain ceramic),ceramic,20.0,80.0,6.0,50.0,water_based,40.0,green
+IPS InLine Dentin (Dental porcelain ceramic),ceramic,20.0,80.0,2.0,75.0,water_based,40.0,green
+IPS InLine Dentin (Dental porcelain ceramic),ceramic,20.0,80.0,6.0,75.0,water_based,40.0,green
+Calcium sulfate hemihydrate,ceramic,40.0,100.0,1.6,75.0,water_based,92.0,sintered
+Aluminum oxide (Alumina),metal,12.5,100.0,3.0,65.0,polymer_based,58.0,green
+Aluminum oxide (Alumina),metal,3.0,50.0,1.6,60.0,polymer_based,62.0,green
+Inconel 718 (Nickel-based superalloy),metal,30.0,100.0,1.6,80.0,water_based,99.8,green
+Alloy 625 (Nickel-based superalloy),metal,30.0,100.0,1.6,80.0,water_based,99.7,sintered
+Silicon carbide (SiC),carbide,30.0,100.0,1.6,70.0,water_based,60.0,green
+Graphite,other,30.0,100.0,1.6,65.0,water_based,55.0,green
+Porcelain ceramic,ceramic,20.0,80.0,4.0,75.0,water_based,40.0,green
+Stainless steel 316L,metal,30.0,100.0,1.6,70.0,water_based,60.0,green
+Silicon carbide (SiC),carbide,12.5,70.0,1.6,65.0,polymer_based,94.0,sintered
+Nickel-Manganese-Gallium (Ni-Mn-Ga) alloy,metal,32.5,100.0,1.6,60.0,water_based,98.0,sintered
+Pharmaceutical powder blend (API + excipients),other,50.0,100.0,1.6,80.0,water_based,40.0,green
+Tungsten carbide–Cobalt (WC-Co),metal,3.0,70.0,1.6,60.0,water_based,98.0,sintered
+Inconel 718,metal,30.0,100.0,1.6,75.0,water_based,100.0,sintered
+17-4 PH stainless steel,metal,30.0,100.0,1.6,70.0,water_based,58.0,green
+Ti-6Al-4V Alloy,metal,50.0,100.0,1.6,30.0,polymer_based,65.0,green
+Pure Iron,metal,45.0,75.0,1.6,200.0,water_based,40.0,green
+Pure Iron (Water-atomized),metal,45.0,75.0,1.6,200.0,water_based,77.65,sintered
