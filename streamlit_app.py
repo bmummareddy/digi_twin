@@ -377,6 +377,84 @@ def data_health_report(df: pd.DataFrame, material: str, d50_um: float) -> pd.Dat
             cols.append(("best %TD", float(d["green_pct_td"].max())))
     return pd.DataFrame(cols, columns=["metric","value"])
 
+def pack_particles_no_cache(polys_wkb_list, diam_units, phi2D_target, max_particles, layer_idx):
+    """
+    Non-cached particle packing for Digital Twin to avoid layer collision.
+    Each call computes fresh with unique random seed based on layer_idx.
+    """
+    if not polys_wkb_list:
+        return np.empty((0,2)), np.empty((0,)), 0.0
+    
+    # Deserialize polygons
+    polys = [wkb.loads(p) for p in polys_wkb_list]
+    dom_all = unary_union(polys)
+    
+    if dom_all.is_empty:
+        return np.empty((0,2)), np.empty((0,)), 0.0
+    
+    minx, miny, maxx, maxy = dom_all.bounds
+    area_dom = dom_all.area
+    
+    diam = np.sort(np.asarray(diam_units))[::-1]
+    placed_xy, placed_r = [], []
+    area_circ = 0.0
+    target_area = float(np.clip(phi2D_target, 0.05, 0.90)) * area_dom
+    
+    # Unique random seed per layer
+    rng = np.random.default_rng(20_000 + layer_idx)
+    
+    cell = max(diam.max()/2.0, (maxx-minx+maxy-miny)/400.0)
+    grid: Dict[Tuple[int,int], List[int]] = {}
+    
+    def no_overlap(x, y, r):
+        gx, gy = int(x//cell), int(y//cell)
+        for ix in range(gx-1, gx+2):
+            for iy in range(gy-1, gy+2):
+                for j in grid.get((ix, iy), []):
+                    dx, dy = x - placed_xy[j][0], y - placed_xy[j][1]
+                    if dx*dx + dy*dy < (r + placed_r[j])**2:
+                        return False
+        return True
+    
+    trials = 0
+    max_trials = 480_000
+    
+    for d in diam:
+        r = d/2.0
+        fit_dom = dom_all.buffer(-r)
+        if getattr(fit_dom, "is_empty", True):
+            continue
+        fminx, fminy, fmaxx, fmaxy = fit_dom.bounds
+        
+        for _ in range(600):
+            trials += 1
+            if trials > max_trials or area_circ >= target_area or len(placed_xy) >= max_particles:
+                break
+            
+            x = rng.uniform(fminx, fmaxx)
+            y = rng.uniform(fminy, fmaxy)
+            
+            if not fit_dom.contains(Point(x, y)):
+                continue
+            if not no_overlap(x, y, r):
+                continue
+            
+            idx = len(placed_xy)
+            placed_xy.append((x, y))
+            placed_r.append(r)
+            gx, gy = int(x//cell), int(y//cell)
+            grid.setdefault((gx, gy), []).append(idx)
+            area_circ += math.pi * r * r
+        
+        if trials > max_trials or area_circ >= target_area or len(placed_xy) >= max_particles:
+            break
+    
+    centers = np.array(placed_xy) if placed_xy else np.empty((0,2))
+    radii = np.array(placed_r) if placed_r else np.empty((0,))
+    phi2D = area_circ / area_dom if area_dom > 0 else 0.0
+    
+    return centers, radii, float(phi2D)
+
 # ------------------------------- TABS -----------------------------------------
 tabs = st.tabs([
     "Predict (Top-5)",
@@ -679,72 +757,11 @@ with tabs[5]:
         polys_local_wkb = [dom.wkb]
         render_fov = 2*half
 
-    # Pack particles (UNCACHED for Digital Twin to avoid layer collision)
-    # NOTE: Intentionally NOT using cached function here because Streamlit's cache
-    # was colliding across layers even with _layer_idx parameter (cylindrical parts
-    # have similar geometry across layers). Computing fresh ensures each layer gets
-    # unique particles. Trade-off: ~2s per layer instead of instant, but correctness
-    # is more important than speed for visualization.
-    # We'll compute fresh each time to ensure different layers get different particles
-    diam_hash = hash(diam_units.tobytes())
-    
-    # Call uncached version for Digital Twin
-    polys_list = [wkb.loads(p) for p in polys_local_wkb] if polys_local_wkb else []
-    dom_all = unary_union(polys_list) if polys_list else None
-    
-    if dom_all and not dom_all.is_empty:
-        minx, miny, maxx, maxy = dom_all.bounds
-        area_dom = dom_all.area
-        diam = np.sort(np.asarray(diam_units))[::-1]
-        placed_xy, placed_r = [], []
-        area_circ = 0.0
-        target_area = float(np.clip(phi2D_target, 0.05, 0.90)) * area_dom
-        rng = np.random.default_rng(20_000 + layer_idx)
-        
-        cell = max(diam.max()/2.0, (maxx-minx+maxy-miny)/400.0)
-        grid = {}
-        
-        def no_overlap(x, y, r):
-            gx, gy = int(x//cell), int(y//cell)
-            for ix in range(gx-1, gx+2):
-                for iy in range(gy-1, gy+2):
-                    for j in grid.get((ix, iy), []):
-                        dx, dy = x - placed_xy[j][0], y - placed_xy[j][1]
-                        if dx*dx + dy*dy < (r + placed_r[j])**2:
-                            return False
-            return True
-        
-        trials = 0
-        for d in diam:
-            r = d/2.0
-            fit_dom = dom_all.buffer(-r)
-            if getattr(fit_dom, "is_empty", True): continue
-            fminx, fminy, fmaxx, fmaxy = fit_dom.bounds
-            
-            for _ in range(600):
-                trials += 1
-                if trials > 480_000 or area_circ >= target_area or len(placed_xy) >= cap:
-                    break
-                x = rng.uniform(fminx, fmaxx)
-                y = rng.uniform(fminy, fmaxy)
-                if not fit_dom.contains(Point(x, y)): continue
-                if not no_overlap(x, y, r): continue
-                
-                idx = len(placed_xy)
-                placed_xy.append((x, y))
-                placed_r.append(r)
-                gx, gy = int(x//cell), int(y//cell)
-                grid.setdefault((gx, gy), []).append(idx)
-                area_circ += math.pi * r * r
-            
-            if trials > 480_000 or area_circ >= target_area or len(placed_xy) >= cap:
-                break
-        
-        centers = np.array(placed_xy) if placed_xy else np.empty((0,2))
-        radii = np.array(placed_r) if placed_r else np.empty((0,))
-        phi2D = area_circ / area_dom if area_dom > 0 else 0.0
-    else:
-        centers, radii, phi2D = np.empty((0,2)), np.empty((0,)), 0.0
+    # Pack particles (NON-CACHED version for Digital Twin)
+    # Call the non-cached packing function to ensure unique particles per layer
+    centers, radii, phi2D = pack_particles_no_cache(
+        polys_local_wkb, diam_units, phi2D_target, cap, layer_idx
+    )
     
     # Debug info
     if len(centers) == 0:
