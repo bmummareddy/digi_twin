@@ -161,17 +161,8 @@ Tips
 
 Sparse data is fine: the app falls back to physics-guided priors (few-shot behavior).
 
----
-
-## Acknowledgment
-
-Prepared for ASM AM&P. App logic and figures were developed with the help of ChatGPT.
-
----
 
 ## License & contact
-
-Choose a license (e.g., MIT) for your repo.  
+ 
 Maintainer: **Bhargavi Mummareddy** — mummareddybhargavi@gmail.com
 
-Issues and PRs welcome.
