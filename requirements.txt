@@ -22,7 +22,7 @@ networkx>=3.3,<3.4
 # Logs (optional)
 rich>=13.9,<14
 protobuf<5
-
+rtree
 
 
 
