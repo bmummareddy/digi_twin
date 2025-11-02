@@ -1,6 +1,7 @@
-# digital_twin.py — STL slice → qualitative packing (fast), designed to be imported by streamlit_app.py
+# digital_twin.py — STL slice → qualitative packing (safe import; no Streamlit cache at import time)
 from __future__ import annotations
-import io, math, importlib.util
+import io, math, importlib.util, hashlib
+from functools import lru_cache
 from typing import List, Tuple, Dict
 import numpy as np
 import streamlit as st
@@ -35,15 +36,24 @@ def _binder_hex(name:str)->str:
     if "solvent" in k: return _COLOR_BINDERS["solvent"]
     return _COLOR_BINDERS["other"]
 
-@st.cache_data(show_spinner=False)
-def _dt_load_mesh(data: bytes):
+# -------- SAFE caching (no Streamlit session needed) --------
+def _bytes_key(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+@lru_cache(maxsize=8)
+def _load_mesh_from_bytes(key: str, payload: bytes):
+    # lru_cache key is the hash; payload rides along but doesn't affect the key
     if not _HAVE_TRIMESH:
         raise RuntimeError("trimesh not installed")
-    m = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh", process=False)
+    m = trimesh.load(io.BytesIO(payload), file_type="stl", force="mesh", process=False)
     if not isinstance(m, trimesh.Trimesh):
         m = m.dump(concatenate=True)
     return m
 
+def _dt_load_mesh(data: bytes):
+    return _load_mesh_from_bytes(_bytes_key(data), data)
+
+# -------- Geometry & packing helpers --------
 def _dt_slice_polys(mesh, z)->List["Polygon"]:
     if not _HAVE_SHAPELY: return []
     try:
@@ -169,12 +179,12 @@ def _dt_scale(ax, fov_mm, length_um=500):
     ax.text((x0+x1)/2, y+0.02*fov_mm, f"{int(length_um)} µm",
             ha="center", va="bottom", fontsize=9, color=_COLOR_BORDER)
 
+# ============================ PUBLIC ENTRY ============================
 def render(material:str, d50_um:float, layer_um:float):
     st.subheader("Digital Twin (Beta) — STL slice + qualitative packing")
     if not (_HAVE_TRIMESH and _HAVE_SHAPELY):
         st.error("Install 'trimesh' and 'shapely' (see requirements.txt)."); return
 
-    # Expect Top-k from main app
     top5 = st.session_state.get("top5_recipes_df")
     if top5 is None or getattr(top5, "empty", True):
         st.info("Generate recommendations first (click Recommend)."); return
@@ -211,7 +221,6 @@ def render(material:str, d50_um:float, layer_um:float):
     diam_um = _dt_psd_um(7000 if fast else 10000, d50_r, seed=9991)
     diam_units = diam_um * um2unit
 
-    # Pick layer
     if mesh is not None:
         minz, maxz = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
         thickness = layer_r * (1e-3 if stl_units=="mm" else 1e-6)
@@ -222,7 +231,6 @@ def render(material:str, d50_um:float, layer_um:float):
     else:
         n_layers, layer_idx, z = 1, 1, 0.0
 
-    # Preview mesh
     if mesh is not None and show_mesh:
         import plotly.graph_objects as go
         figm = go.Figure(data=[go.Mesh3d(
@@ -252,7 +260,6 @@ def render(material:str, d50_um:float, layer_um:float):
         polys_local=[box(0,0,2*half,2*half)]
         render_fov = 2*half
 
-    # Pack particles
     centers, radii, phi2D = _dt_pack(
         polys_local, diam_units, phi2D_target,
         max_particles=int(cap),
@@ -260,7 +267,6 @@ def render(material:str, d50_um:float, layer_um:float):
         seed=20_000 + layer_idx
     )
 
-    # Render
     def _panel_particles(ax):
         ax.add_patch(Rectangle((0,0), render_fov, render_fov, facecolor="white", edgecolor=_COLOR_BORDER, linewidth=1.2))
         for (x,y), r in zip(centers, radii):
