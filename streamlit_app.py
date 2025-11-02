@@ -1,124 +1,521 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-import io, os, math, importlib.util
-from typing import List, Tuple, Optional, Dict
+# streamlit_app.py — BJAM Binder-Jet AM Recommender
+# - Ivory light theme with forced dark text (no raw CSS text)
+# - Heatmap, sensitivity, Pareto, formulae
+# - Packing tab:
+#     • Square side (×D50) slider + densify toggle
+#     • Side-by-side Packing slice + Printed-layer (pixelated), same size
+#     • Small captions (no large titles)
 
+from __future__ import annotations
+
+from pathlib import Path
+from datetime import datetime
 import numpy as np
 import pandas as pd
-import streamlit as st
-import plotly.graph_objects as go
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import streamlit as st
+
+# ---- Project utilities (already in repo)
+from shared import (
+    load_dataset,
+    train_green_density_models,
+    predict_quantiles,
+    physics_priors,
+    guardrail_ranges,
+    copilot,
+    suggest_binder_family,
+)
+
+# ======================= Page & Theme =======================
+st.set_page_config(
+    page_title="BJAM Predictions",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---- Global CSS (inject safely; prevents raw CSS text)
+CSS = """
+<style>
+  /* Font & base */
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+  :root { --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }
+  .stApp { background: #FFFDF7 !important; }
+  html, body, [class*="css"] { font-family: var(--font) !important; }
+
+  /* Force dark text on light bg */
+  html, body, h1, h2, h3, h4, h5, h6, p, span, label, div, li, code, pre,
+  .stMarkdown, .stText, .stCaption, .stAlert, .stMetric {
+    color: #111827 !important;
+  }
+
+  /* Inputs */
+  .stTextInput input, .stNumberInput input { color:#111827 !important; }
+  .stSelectbox [data-baseweb="select"] * { color:#111827 !important; }
+  .stRadio > div label { color:#111827 !important; }
+  .stSlider { color:#111827 !important; }
+
+  /* Layout tweaks */
+  .block-container { max-width: 1200px; }
+  .stTabs [data-baseweb="tab"] { font-weight:600; color:#111827 !important; }
+  .stDataFrame { background: rgba(255,255,255,.65); }
+
+  /* KPI cards */
+  .kpi {
+    background:#fff; border-radius:12px; padding:16px 18px;
+    border:1px solid rgba(0,0,0,0.06); box-shadow:0 1px 2px rgba(0,0,0,0.03);
+  }
+  .kpi .kpi-label { color:#1f2937; font-weight:600; font-size:1.0rem; opacity:.9; white-space:nowrap; }
+  .kpi .kpi-value-line { display:flex; align-items:baseline; gap:.35rem; white-space:nowrap; }
+  .kpi .kpi-value { color:#111827; font-weight:800; font-size:2.2rem; line-height:1.05;
+                    font-variant-numeric: tabular-nums; letter-spacing:.2px; }
+  .kpi .kpi-unit  { color:#111827; font-weight:700; font-size:1.1rem; opacity:.85; }
+  .kpi .kpi-sub   { color:#374151; opacity:.65; font-size:.9rem; margin-top:.25rem; white-space:nowrap; }
+
+  /* Footer */
+  .footer { text-align:center; margin: 28px 0 6px; color:#1f2937; opacity:.9; font-size:0.95rem; }
+  .footer a { color:#0d6efd; text-decoration:none; }
+  .footer a:hover { text-decoration:underline; }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+# ======================= Data & Models =======================
+df_base, src = load_dataset(".")
+models, meta = train_green_density_models(df_base)
+
+# ======================= Sidebar =======================
+with st.sidebar:
+    st.header("BJAM Controls")
+    if src and len(df_base):
+        st.success(f"Data source: {Path(src).name} · rows={len(df_base):,}")
+        st.download_button(
+            "Download source dataset (CSV)",
+            data=df_base.to_csv(index=False).encode("utf-8"),
+            file_name=Path(src).name,
+            mime="text/csv",
+        )
+    else:
+        st.warning("No dataset found. App will use physics priors only (few-shot disabled).")
+
+    st.divider()
+    guardrails_on = st.toggle(
+        "Guardrails", True,
+        help="ON: stable windows (binder 60–110%, speed ≈1.2–3.5 mm/s, layer ≈3–5×D50). OFF: wider exploration."
+    )
+    target_green = st.slider("Target green %TD", 80, 98, 90, 1)
+    st.caption("Recommendations prefer **q10 ≥ target** for conservatism.")
+
+# ======================= Header =======================
+st.title("BJAM — Binder-Jet AM Parameter Recommender")
+st.caption("Physics-guided + few-shot • Custom materials supported • Guardrails toggle")
+
+with st.expander("Preview source data", expanded=False):
+    if len(df_base): st.dataframe(df_base.head(25), use_container_width=True)
+    else: st.info("No rows to preview.")
+
+st.divider()
+
+# ======================= Inputs =======================
+left, right = st.columns([1.2, 1])
+
+with left:
+    st.subheader("Inputs")
+
+    mode = st.radio("Material source", ["From dataset", "Custom"], horizontal=True)
+    materials = sorted(df_base["material"].dropna().astype(str).unique().tolist()) if "material" in df_base else []
+
+    if mode == "From dataset" and materials:
+        material = st.selectbox("Material (from dataset)", options=materials, index=0)
+        d50_default = 30.0
+        if "d50_um" in df_base.columns:
+            sel = df_base["material"].astype(str) == material
+            if sel.any():
+                d50_default = float(df_base.loc[sel, "d50_um"].dropna().median() or 30.0)
+        material_class = (
+            df_base.loc[df_base["material"].astype(str) == material, "material_class"]
+            .dropna().astype(str).iloc[0]
+            if {"material","material_class"}.issubset(df_base.columns) and
+               (df_base["material"].astype(str) == material).any()
+            else "metal"
+        )
+    else:
+        material = st.text_input("Material (custom)", value="Al2O3")
+        material_class = st.selectbox("Material class", ["metal","oxide","carbide","other"], index=1)
+        d50_default = 30.0
+
+    d50_um = st.number_input("D50 (µm)", 1.0, 150.0, float(d50_default), 1.0,
+                             help="Layer guidance typically ≈ 3–5×D50.")
+    pri = physics_priors(d50_um, binder_type_guess=None)
+    gr = guardrail_ranges(d50_um, on=guardrails_on)
+    t_lo, t_hi = gr["layer_thickness_um"]
+    layer_um = st.slider("Layer thickness (µm)", float(round(t_lo)), float(round(t_hi)),
+                         float(round(pri["layer_thickness_um"])), 1.0)
+
+    auto_binder = suggest_binder_family(material, material_class)
+    binder_choice = st.selectbox(
+        "Binder family",
+        [f"auto ({auto_binder})", "solvent_based", "water_based"],
+        help="Auto uses material class: water for oxide/carbide; solvent otherwise."
+    )
+    binder_family = auto_binder if binder_choice.startswith("auto") else binder_choice
+
+with right:
+    st.subheader("Priors (for intuition)")
+    k1, k2, k3 = st.columns(3)
+
+    def kpi_num(col, label: str, value: str, unit: str = "", sub: str = ""):
+        col.markdown(
+            f"""
+            <div class="kpi">
+              <div class="kpi-label">{label}</div>
+              <div class="kpi-value-line">
+                <div class="kpi-value">{value}</div>
+                <div class="kpi-unit">{unit}</div>
+              </div>
+              <div class="kpi-sub">{sub}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    kpi_num(k1, "Prior binder", f"{pri['binder_saturation_pct']:.0f}", "%")
+    kpi_num(k2, "Prior speed",  f"{pri['roller_speed_mm_s']:.2f}", "mm/s")
+    kpi_num(k3, "Layer/D50",    f"{layer_um/d50_um:.2f}", "×")
+
+st.divider()
+
+# ======================= Recommendations =======================
+st.subheader("Recommended parameters")
+
+colL, colR = st.columns([1, 1])
+top_k = colL.slider("How many to show", 3, 8, 5, 1)
+run_recs = colR.button("Recommend", type="primary", use_container_width=True)
+
+if run_recs:
+    recs = copilot(
+        material=material, d50_um=float(d50_um), df_source=df_base, models=models,
+        guardrails_on=guardrails_on, target_green=float(target_green), top_k=int(top_k)
+    )
+    recs["binder_type"] = binder_family
+    pretty = recs.rename(columns={
+        "binder_type": "Binder",
+        "binder_%": "Binder sat (%)",
+        "speed_mm_s": "Speed (mm/s)",
+        "layer_um": "Layer (µm)",
+        "predicted_%TD_q10": "q10 %TD",
+        "predicted_%TD_q50": "q50 %TD",
+        "predicted_%TD_q90": "q90 %TD",
+        "meets_target_q10": f"Meets target (q10 ≥ {target_green}%)",
+    })
+    st.dataframe(
+        pretty,
+        use_container_width=True,
+        column_config={
+            "Binder sat (%)": st.column_config.NumberColumn(format="%.1f"),
+            "Speed (mm/s)":   st.column_config.NumberColumn(format="%.2f"),
+            "Layer (µm)":     st.column_config.NumberColumn(format="%.0f"),
+            "q10 %TD":        st.column_config.NumberColumn(format="%.2f"),
+            "q50 %TD":        st.column_config.NumberColumn(format="%.2f"),
+            "q90 %TD":        st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+    st.download_button(
+        "Download recommendations (CSV)",
+        data=pretty.to_csv(index=False).encode("utf-8"),
+        file_name="bjam_recommendations.csv",
+        type="secondary",
+        use_container_width=True,
+    )
+else:
+    st.info("Click **Recommend** to generate top-k parameter sets aimed at your target green %TD.")
+
+st.divider()
+
+# ======================= Visuals =======================
+tabs = st.tabs([
+    "Heatmap (speed × saturation)",
+    "Saturation sensitivity",
+    "Packing (2D slice)",
+    "Pareto frontier",
+    "Formulae",
+])
+
+def _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family, nx=55, ny=45):
+    sats = np.linspace(float(b_lo), float(b_hi), nx)
+    spds = np.linspace(float(s_lo), float(s_hi), ny)
+    grid = pd.DataFrame([(b,v,layer_um,d50_um,material) for b in sats for v in spds],
+                        columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
+    grid["material_class"] = material_class
+    grid["binder_type_rec"] = binder_family
+    return grid, sats, spds
+
+# ---- Heatmap
+with tabs[0]:
+    st.subheader("Heatmap — Predicted green %TD")
+    b_lo,b_hi = gr["binder_saturation_pct"]; s_lo,s_hi = gr["roller_speed_mm_s"]
+    grid, Xs, Ys = _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family)
+    scored = predict_quantiles(models, grid)
+    Z = scored.sort_values(["binder_saturation_pct","roller_speed_mm_s"])["td_q50"].to_numpy().reshape(len(Xs), len(Ys)).T
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(x=list(Xs), y=list(Ys), z=Z, colorscale="Viridis", colorbar=dict(title="%TD")))
+    fig.add_trace(go.Contour(x=list(Xs), y=list(Ys), z=Z,
+                             contours=dict(start=90, end=90, size=1, coloring="none"),
+                             line=dict(width=3), showscale=False, name="90% TD"))
+    fig.add_trace(go.Scatter(x=[80], y=[1.6], mode="markers+text",
+                             marker=dict(size=10, symbol="x", color="#111827"),
+                             text=["prior"], textposition="top center"))
+    fig.update_layout(
+        xaxis_title="Binder saturation (%)",
+        yaxis_title="Roller speed (mm/s)",
+        height=520, margin=dict(l=10, r=10, t=40, b=10),
+        title=f"Layer={layer_um:.0f} µm · D50={d50_um:.0f} µm · Material={material} ({material_class}) · Source={Path(src).name if src else '—'}",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---- Sensitivity
+with tabs[1]:
+    st.subheader("Saturation sensitivity (q10–q90)")
+    b_lo,b_hi = gr["binder_saturation_pct"]; s_lo,s_hi = gr["roller_speed_mm_s"]
+    sats = np.linspace(float(b_lo), float(b_hi), 61)
+    curve_df = pd.DataFrame({
+        "binder_saturation_pct": sats,
+        "roller_speed_mm_s": 1.6,
+        "layer_thickness_um": float(layer_um),
+        "d50_um": float(d50_um),
+        "material": material,
+        "material_class": material_class,
+        "binder_type_rec": binder_family,
+    })
+    cs = predict_quantiles(models, curve_df)
+
+    fig2, ax2 = plt.subplots(figsize=(7.0, 4.1), dpi=175)
+    ax2.plot(cs["binder_saturation_pct"], cs["td_q50"], color="#1f77b4", linewidth=2.0, label="q50")
+    ax2.fill_between(cs["binder_saturation_pct"], cs["td_q10"], cs["td_q90"], alpha=0.18, label="q10–q90")
+    ax2.axhline(target_green, linestyle="--", linewidth=1.2, color="#374151", label=f"Target {target_green}%")
+    ax2.set_xlabel("Binder saturation (%)"); ax2.set_ylabel("Predicted green %TD")
+    ax2.grid(True, axis="y", alpha=0.18); ax2.legend(frameon=False)
+    st.pyplot(fig2, clear_figure=True)
+
+# ---- Packing (side-by-side, small, pixelated)
+with tabs[2]:
+    st.subheader("Packing — 2D slice")
+    st.caption("Square slice sized in ×D50. Toggle densification; preview a printed layer with binder fill.")
+
+    # Controls
+    c1, c2, c3, c4 = st.columns(4)
+    side_mult = c1.slider("Square side (× D50)", 10, 60, 20, 2,
+                          help="Side length of the slice in multiples of D50.")
+    cv_pct   = c2.slider("Polydispersity (CV %)", 0, 60, 20, 5,
+                         help="Coefficient of variation of particle diameter (lognormal).")
+    densify  = c3.toggle("Densify packing", False,
+                         help="OFF: baseline packing; ON: more tries ⇒ tighter fill.")
+    seed     = c4.number_input("Seed", 0, 9999, 0, 1)
+
+    # Derived
+    W_mult = int(side_mult)
+    base_ref, dense_ref = 260, 520     # ref counts at 20×D50
+    baseline_particles   = int(base_ref  * (W_mult/20)**2)
+    densified_particles  = int(dense_ref * (W_mult/20)**2)
+    Npx = int(21 * W_mult)             # keep ~constant pixels per D50
+
+    # RSA helper
+    def rsa_pack(max_particles: int, D50_um: float, cv_pct: float, W_mult: int, seed: int, densify: bool):
+        rng = np.random.default_rng(seed)
+        cv = cv_pct/100.0
+        if cv <= 0:
+            diam_um = np.full(max_particles, float(D50_um))
+        else:
+            sigma = float(np.sqrt(np.log(1.0 + cv**2)))
+            diam_um = float(D50_um) * rng.lognormal(mean=0.0, sigma=sigma, size=max_particles)
+            diam_um = np.clip(diam_um, 0.4*float(D50_um), 1.8*float(D50_um))
+        diam_u = diam_um / float(D50_um)
+        radii = 0.5 * np.sort(diam_u)[::-1]
+        W = float(W_mult)
+
+        pts = []
+        MAX_ATTEMPTS = 40000; attempts = 0
+
+        def can_place(x,y,r):
+            if x-r<0 or x+r>W or y-r<0 or y+r>W: return False
+            for (px,py,pr) in pts:
+                dx = x - px; dy = y - py
+                if dx*dx + dy*dy < (r+pr)**2: return False
+            return True
+
+        for r in radii:
+            tries = 240 if not densify else 280
+            for _ in range(tries):
+                x = rng.uniform(r, W-r); y = rng.uniform(r, W-r)
+                if can_place(x,y,r):
+                    pts.append((x,y,r)); break
+            attempts += 1
+            if attempts > MAX_ATTEMPTS: break
+
+        rs = np.array([r for (_,_,r) in pts])
+        phi = (np.pi*np.sum(rs**2))/(W*W) if W>0 else 0.0
+        return pts, phi, W
+
+    # Build packing
+    num_p = densified_particles if densify else baseline_particles
+    pts, phi_area, W = rsa_pack(num_p, float(d50_um), float(cv_pct), W_mult, int(seed), densify)
+
+    # Small controls row for printed-layer preview (kept above both plots)
+    ctrlL, ctrlR = st.columns([3, 1])
+    binder_sat_pct = ctrlL.slider("Binder saturation (%)", 50, 100, 80, 1)
+    t_over_D50 = float(layer_um) / float(d50_um)
+    ctrlR.metric("Layer/D50 used", f"{t_over_D50:.2f}×")
+
+    # Rasterize solids & binder mask (for right plot)
+    xx = np.linspace(0, W, Npx); yy = np.linspace(0, W, Npx)
+    X, Y = np.meshgrid(xx, yy)
+    solid = np.zeros((Npx, Npx), dtype=bool)
+    for (x, y, r) in pts:
+        solid |= (X - x) ** 2 + (Y - y) ** 2 <= r ** 2
+    void = ~solid
+
+    rng_local = np.random.default_rng(int(seed) + 12345)
+    idx_void = np.flatnonzero(void.ravel())
+    k = int(len(idx_void) * (binder_sat_pct / 100.0))
+    chosen = rng_local.choice(idx_void, size=k, replace=False) if k > 0 else np.array([], dtype=int)
+    binder_mask = np.zeros_like(void, dtype=bool)
+    if k > 0: binder_mask.ravel()[chosen] = True
+
+    # === Side-by-side plots (identical sizes) ===
+    FIGSIZE = (1.6, 1.6)  # smaller, consistent squares
+    DPI = 300
+
+    colA, colB = st.columns(2)
+
+    # LEFT: packing slice (circles)
+    with colA:
+        figP, axP = plt.subplots(figsize=FIGSIZE, dpi=DPI)
+        axP.set_aspect('equal', 'box')
+        axP.add_patch(plt.Rectangle((0, 0), W, W, fill=False, linewidth=1.1, color='#111827'))
+        for (x, y, r) in pts:
+            axP.add_patch(plt.Circle((x, y), r, facecolor='#3b82f6', edgecolor='#111827',
+                                     linewidth=0.40, alpha=0.92))
+        axP.set_xlim(0, W); axP.set_ylim(0, W)
+        axP.set_xticks([]); axP.set_yticks([])
+        plt.tight_layout(pad=0.1)
+        st.pyplot(figP, clear_figure=True)
+        side_um = W * float(d50_um)
+        st.caption(f"Packing {'(densified)' if densify else '(baseline)'} • φ≈{phi_area*100:.1f}% • side≈{side_um:.0f} µm")
+
+    # RIGHT: printed layer (pixelated)
+    with colB:
+        figL, axL = plt.subplots(figsize=FIGSIZE, dpi=DPI)
+        axL.set_aspect('equal', 'box')
+        img = np.zeros_like(solid, dtype=float)
+        img[solid] = 0.60          # solids
+        img[binder_mask] = 0.95    # binder fill
+        axL.imshow(
+            img, extent=[0, W, 0, W], origin='lower', vmin=0, vmax=1,
+            interpolation='nearest'  # pixelate
+        )
+        axL.add_patch(plt.Rectangle((0, 0), W, W, fill=False, linewidth=1.1, color='#111827'))
+        axL.set_xlim(0, W); axL.set_ylim(0, W)
+        axL.set_xticks([]); axL.set_yticks([])
+        plt.tight_layout(pad=0.1)
+        st.pyplot(figL, clear_figure=True)
+        st.caption(f"Printed layer • binder≈{binder_sat_pct}% • t/D50={t_over_D50:.2f}")
+
+# ---- Pareto
+with tabs[3]:
+    st.subheader("Pareto frontier — Binder vs green %TD (fixed layer & D50)")
+    b_lo,b_hi = gr["binder_saturation_pct"]; s_lo,s_hi = gr["roller_speed_mm_s"]
+    grid_p, _, _ = _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family, nx=80, ny=1)
+    sc_p = predict_quantiles(models, grid_p)[["binder_saturation_pct","td_q50"]].dropna().sort_values("binder_saturation_pct")
+
+    pts_line = sc_p.values; idx=[]; best=-1
+    for i,(b,td) in enumerate(pts_line[::-1]):
+        if td>best: idx.append(len(pts_line)-1-i); best=td
+    idx = sorted(idx)
+
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=sc_p["binder_saturation_pct"], y=sc_p["td_q50"], mode="markers",
+                              marker=dict(size=6, color="#1f77b4"), name="Candidates"))
+    fig4.add_trace(go.Scatter(x=sc_p.iloc[idx]["binder_saturation_pct"], y=sc_p.iloc[idx]["td_q50"],
+                              mode="lines+markers", marker=dict(size=7, color="#111827"),
+                              line=dict(width=2, color="#111827"), name="Pareto frontier"))
+    fig4.update_layout(xaxis_title="Binder saturation (%)", yaxis_title="Predicted green %TD (q50)",
+                       height=460, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig4, use_container_width=True)
+
+# ---- Formulae
+with tabs[4]:
+    st.subheader("Formulae (symbols)")
+    st.latex(r"\%TD = \frac{\rho_{\mathrm{bulk}}}{\rho_{\mathrm{theoretical}}}\times 100\%")
+    st.latex(r"3 \le \frac{t}{D_{50}} \le 5")
+    st.latex(r"\phi = \frac{V_{\text{solids}}}{V_{\text{total}}}")
+    st.caption("Few-shot model refines these physics-guided priors using your dataset.")
+
+# ======================= Diagnostics & Footer =======================
+with st.expander("Diagnostics", expanded=False):
+    st.write("Guardrails on:", guardrails_on)
+    st.write("Source file:", src or "—")
+    st.write("Models meta:", meta if meta else {"note": "No trained models (physics-only)."})
+
+st.markdown(f"""
+<div class="footer">
+<strong>© {datetime.now().year} Bhargavi Mummareddy</strong> • Contact:
+<a href="mailto:mummareddybhargavi@gmail.com">mummareddybhargavi@gmail.com</a><br/>
+</div>
+""", unsafe_allow_html=True)
+# -*- coding: utf-8 -*-
+# Digital-twin tab: STL → layer slice → fast 2D qualitative packing
+import io, math, importlib.util
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from PIL import Image, ImageDraw
 
-# Local utils
-from shared import load_dataset, train_green_density_models, predict_quantiles, guardrail_ranges
-
-# ------------------------------- Page config & style --------------------------
-st.set_page_config(page_title="BJAM Predictions", page_icon="🟨", layout="wide")
-BUILD = "2025-11-01 — Original flow + Digital Twin (Beta) — layer_thickness_um fix"
-st.caption(f"Build: {BUILD}")
-st.markdown("""
-<style>
-.stApp{background:linear-gradient(180deg,#FFFDF8 0%,#FFF6E9 50%,#FFF1DD 100%)}
-[data-testid="stSidebar"]{background:#fffdfa;border-right:1px solid #f3e8d9}
-.stTabs [data-baseweb="tab-list"]{gap:12px}
-.stTabs [data-baseweb="tab"]{background:#fff;border:1px solid #f3e8d9;border-radius:10px;padding:6px 10px}
-.block-container{padding-top:1.0rem;padding-bottom:1.0rem}
-</style>
-""", unsafe_allow_html=True)
-
-# Quick cache reset button
-with st.sidebar:
-    if st.button("Clear cached data & restart", use_container_width=True):
-        try: st.cache_data.clear()
-        except Exception: pass
-        try: st.cache_resource.clear()
-        except Exception: pass
-        for k in list(st.session_state.keys()): del st.session_state[k]
-        st.success("Cache cleared. Reloading…")
-        st.experimental_rerun()
-
-# ------------------------------- Optional geometry deps -----------------------
-HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
-HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
-HAVE_SCIPY   = importlib.util.find_spec("scipy")   is not None
-if HAVE_TRIMESH: import trimesh  # type: ignore
-if HAVE_SHAPELY:
+# Optional deps
+_HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
+_HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
+_HAVE_SCIPY   = importlib.util.find_spec("scipy")   is not None
+if _HAV E_TRIMESH:
+    import trimesh  # type: ignore
+if _HAVE_SHAPELY:
     from shapely.geometry import Polygon, Point, box  # type: ignore
     from shapely.ops import unary_union  # type: ignore
-if HAVE_SCIPY:
+if _HAVE_SCIPY:
     from scipy import ndimage as ndi  # type: ignore
-from scipy.ndimage import gaussian_filter
 
-# ------------------------------- Colors --------------------------------------
-BINDER_COLORS = {"water_based":"#F2D06F","solvent_based":"#F2B233","furan":"#F5C07A","acrylic":"#FFD166","other":"#F4B942"}
-PARTICLE="#2F6CF6"; EDGE="#1f2937"; BORDER="#111111"; VOID="#FFFFFF"
-def binder_color(name:str)->str:
-    key=(name or "").lower()
-    for k,v in BINDER_COLORS.items():
-        if k in key: return v
-    return BINDER_COLORS["other"]
+# ------- minimal, private helpers (namespaced to avoid collisions) -------
+_COLOR_PARTICLE = "#2F6CF6"
+_COLOR_EDGE     = "#1f2937"
+_COLOR_BORDER   = "#111111"
+_COLOR_VOID     = "#FFFFFF"
+_COLOR_BINDERS  = {"water":"#F2D06F", "solvent":"#F2B233", "other":"#F4B942"}
 
-# ------------------------------- Packing helpers ------------------------------
-def sample_psd_um(n: int, d50_um: float, d10_um: Optional[float], d90_um: Optional[float], seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    med = max(1e-9, float(d50_um))
-    if d10_um and d90_um and d90_um > d10_um > 0:
-        m = np.log(med); s = (np.log(d90_um) - np.log(d10_um)) / (2*1.2815515655446004)
-        s = float(max(s, 0.05))
-    else:
-        m, s = np.log(med), 0.25
-    d = np.exp(rng.normal(m, s, size=n))
-    return np.clip(d, 0.30*med, 3.00*med)
+def _binder_hex(name:str)->str:
+    k = (name or "").lower()
+    if "water" in k: return _COLOR_BINDERS["water"]
+    if "solvent" in k: return _COLOR_BINDERS["solvent"]
+    return _COLOR_BINDERS["other"]
 
-def draw_scale_bar(ax, fov_mm, length_um=500):
-    length_mm = length_um/1000.0
-    if length_mm >= fov_mm: return
-    pad = 0.06*fov_mm
-    x0 = fov_mm - pad - length_mm; x1 = fov_mm - pad
-    y = pad*0.6
-    ax.plot([x0,x1],[y,y], lw=3.2, color="#111111")
-    ax.text((x0+x1)/2, y+0.02*fov_mm, f"{int(length_um)} µm", ha="center", va="bottom", fontsize=9, color="#111111")
+@st.cache_data(show_spinner=False)
+def _dt_load_mesh(data: bytes):
+    if not _HAVE_TRIMESH:
+        raise RuntimeError("trimesh not installed")
+    m = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh", process=False)
+    if not isinstance(m, trimesh.Trimesh):
+        m = m.dump(concatenate=True)
+    return m
 
-def raster_mask(centers, radii, fov, px=900):
-    img=Image.new("L",(px,px),color=0); drw=ImageDraw.Draw(img)
-    sx=px/fov; sy=px/fov
-    for (x,y),r in zip(centers,radii):
-        x0=int((x-r)*sx); y0=int((fov-(y+r))*sy); x1=int((x+r)*sx); y1=int((fov-(y-r))*sy)
-        drw.ellipse([x0,y0,x1,y1], fill=255)
-    return (np.array(img)>0)
-
-def voids_from_saturation(pore_mask, saturation, rng=None):
-    if rng is None: rng=np.random.default_rng(0)
-    pore=int(pore_mask.sum())
-    if pore<=0: return np.zeros_like(pore_mask,bool)
-    target=int(round((1.0 - saturation)*pore))
-    if target<=0: return np.zeros_like(pore_mask,bool)
-    if HAVE_SCIPY:
-        dist=ndi.distance_transform_edt(pore_mask)
-        noise=ndi.gaussian_filter(rng.standard_normal(pore_mask.shape),sigma=2.0)
-        field=dist+0.18*noise
-        flat=field[pore_mask]
-        kth=np.partition(flat,len(flat)-target)[len(flat)-target]
-        vm=np.zeros_like(pore_mask,bool); vm[pore_mask]=field[pore_mask]>=kth
-        vm=ndi.binary_opening(vm,iterations=1); vm=ndi.binary_closing(vm,iterations=1)
-        return vm
-    # dotted fallback
-    h,w=pore_mask.shape; vm=np.zeros_like(pore_mask,bool); area=0; tries=0
-    while area<target and tries<120000:
-        tries+=1; r=int(np.clip(np.random.normal(3.0,1.2),1.0,6.0))
-        x=np.random.randint(r,w-r); y=np.random.randint(r,h-r)
-        if pore_mask[y,x]:
-            yy,xx=np.ogrid[-y:h-y,-x:w-x]
-            disk=(xx*xx+yy*yy)<=r*r
-            add=np.logical_and(disk,pore_mask); vm[add]=True; area=int(vm.sum())
-    return vm
-
-def slice_polys(mesh, z)->List["Polygon"]:
+def _dt_slice_polys(mesh, z)->List["Polygon"]:
+    if not _HAVE_SHAPELY:
+        return []
     try:
         sec = mesh.section(plane_origin=(0,0,z), plane_normal=(0,0,1))
         if sec is None: return []
@@ -128,7 +525,7 @@ def slice_polys(mesh, z)->List["Polygon"]:
     except Exception:
         return []
 
-def crop_window(polys, fov):
+def _dt_crop_to_fov(polys, fov):
     if not polys: return [], (0.0, 0.0)
     dom = unary_union(polys); cx,cy = dom.centroid.x, dom.centroid.y
     half=fov/2.0; xmin, ymin = cx-half, cy-half
@@ -138,7 +535,7 @@ def crop_window(polys, fov):
     geoms = [res] if isinstance(res, Polygon) else [g for g in res.geoms if isinstance(g, Polygon)]
     return geoms, (xmin, ymin)
 
-def to_local(polys, origin_xy):
+def _dt_to_local(polys, origin_xy):
     if not polys: return []
     ox, oy = origin_xy
     out=[]
@@ -147,26 +544,28 @@ def to_local(polys, origin_xy):
         out.append(Polygon(np.c_[np.array(x)-ox, np.array(y)-oy]))
     return out
 
-def pack_in_domain(polys, diam_units, phi2D_target, max_particles, max_trials, seed):
-    """Greedy circle packing with erosion-by-radius admissibility and a light grid for speed."""
-    if not HAVE_SHAPELY:
-        raise RuntimeError("This view requires 'shapely'. Please add it to requirements.txt.")
-    if not polys: return np.empty((0,2)), np.empty((0,)), 0.0
+def _dt_psd_um(n:int, d50_um:float, seed:int)->np.ndarray:
+    rng = np.random.default_rng(seed)
+    mu, sigma = np.log(max(d50_um,1e-6)), 0.25
+    d = np.exp(rng.normal(mu, sigma, size=n))
+    return np.clip(d, 0.3*d50_um, 3.0*d50_um)
 
-    dom_all = unary_union(polys)
-    minx, miny, maxx, maxy = dom_all.bounds
-    area_dom = dom_all.area
+def _dt_pack(polys, diam_units, phi_target, max_particles, max_trials, seed):
+    if not _HAVE_SHAPELY or not polys:
+        return np.empty((0,2)), np.empty((0,)), 0.0
+    dom = unary_union(polys)
+    minx, miny, maxx, maxy = dom.bounds
+    area_dom = dom.area
 
     diam = np.sort(np.asarray(diam_units))[::-1]
     placed_xy, placed_r = [], []
-    area_circ = 0.0
-    target_area = float(np.clip(phi2D_target, 0.05, 0.90)) * area_dom
+    area_circ, target_area = 0.0, float(np.clip(phi_target,0.05,0.90))*area_dom
     rng = np.random.default_rng(seed)
 
-    cell = max(diam.max()/2.0, (maxx-minx+maxy-miny)/400.0)
+    cell = max(diam.max()/2.0, (maxx-minx+maxy-miny)/450.0)
     grid: Dict[Tuple[int,int], List[int]] = {}
 
-    def no_overlap(x, y, r):
+    def _ok(x, y, r):
         gx, gy = int(x//cell), int(y//cell)
         for ix in range(gx-1, gx+2):
             for iy in range(gy-1, gy+2):
@@ -179,377 +578,217 @@ def pack_in_domain(polys, diam_units, phi2D_target, max_particles, max_trials, s
     trials = 0
     for d in diam:
         r = d/2.0
-        fit_dom = dom_all.buffer(-r)
-        if getattr(fit_dom, "is_empty", True): continue
-        fminx, fminy, fmaxx, fmaxy = fit_dom.bounds
-
-        for _ in range(600):
+        fit = dom.buffer(-r)
+        if getattr(fit,"is_empty",True): continue
+        fx0, fy0, fx1, fy1 = fit.bounds
+        for _ in range(480):  # tight loop cap → faster
             trials += 1
-            if trials > max_trials or area_circ >= target_area or len(placed_xy) >= max_particles:
+            if trials>max_trials or area_circ>=target_area or len(placed_xy)>=max_particles:
                 break
-            x = rng.uniform(fminx, fmaxx); y = rng.uniform(fminy, fmaxy)
-            if not fit_dom.contains(Point(x, y)): continue
-            if not no_overlap(x, y, r): continue
-
+            x = rng.uniform(fx0, fx1); y = rng.uniform(fy0, fy1)
+            if not fit.contains(Point(x,y)) or not _ok(x,y,r):
+                continue
             idx = len(placed_xy)
-            placed_xy.append((x, y)); placed_r.append(r)
+            placed_xy.append((x,y)); placed_r.append(r)
             gx, gy = int(x//cell), int(y//cell)
-            grid.setdefault((gx, gy), []).append(idx)
-            area_circ += math.pi * r * r
-
-        if trials > max_trials or area_circ >= target_area or len(placed_xy) >= max_particles:
+            grid.setdefault((gx,gy), []).append(idx)
+            area_circ += math.pi*r*r
+        if trials>max_trials or area_circ>=target_area or len(placed_xy)>=max_particles:
             break
 
     centers = np.array(placed_xy) if placed_xy else np.empty((0,2))
     radii   = np.array(placed_r)  if placed_r  else np.empty((0,))
-    phi2D   = area_circ / area_dom if area_dom > 0 else 0.0
-    return centers, radii, float(phi2D)
+    phi     = area_circ/area_dom if area_dom>0 else 0.0
+    return centers, radii, float(phi)
 
-# ------------------------------- Data & models --------------------------------
-df_base, src_path = load_dataset(".")
-models, meta = train_green_density_models(df_base)  # your shared.py can accept df
+def _dt_bitmap_mask(centers, radii, fov, px=900):
+    img=Image.new("L",(px,px),color=0); drw=ImageDraw.Draw(img)
+    sx=px/fov; sy=px/fov
+    for (x,y),r in zip(centers,radii):
+        x0=int((x-r)*sx); y0=int((fov-(y+r))*sy); x1=int((x+r)*sx); y1=int((fov-(y-r))*sy)
+        drw.ellipse([x0,y0,x1,y1], fill=255)
+    return (np.array(img)>0)
 
-# ------------------------------- Sidebar --------------------------------------
-with st.sidebar:
-    st.header("Inputs")
-    materials = sorted(df_base["material"].dropna().astype(str).unique().tolist()) if "material" in df_base.columns else []
-    material = st.selectbox("Material", materials, index=0) if materials else st.text_input("Material", "Alumina")
-    d50_um  = st.number_input("D50 (µm)", min_value=1.0, value=60.0, step=1.0)
-    layer_um = st.slider("Layer thickness (µm)", 5, 300, int(max(10, min(200, 0.9*d50_um))), 1)
-    target_green = st.slider("Target green density (%TD)", 80, 98, 90, 1)
-    guardrails_on = st.toggle("Guardrails", value=True)
+def _dt_voids(pore_mask, sat, seed=0):
+    if pore_mask.sum()==0: return np.zeros_like(pore_mask,bool)
+    want = int(round((1.0 - float(sat))*int(pore_mask.sum())))
+    if want<=0: return np.zeros_like(pore_mask,bool)
+    if _HAVE_SCIPY:
+        dist = ndi.distance_transform_edt(pore_mask)
+        noise = ndi.gaussian_filter(np.random.default_rng(seed).standard_normal(pore_mask.shape), sigma=2.0)
+        field = dist + 0.18*noise
+        flat  = field[pore_mask]
+        kth   = np.partition(flat, len(flat)-want)[len(flat)-want]
+        vm    = np.zeros_like(pore_mask,bool); vm[pore_mask]=field[pore_mask]>=kth
+        vm    = ndi.binary_opening(vm, iterations=1); vm = ndi.binary_closing(vm, iterations=1)
+        return vm
+    # dotted fallback
+    h,w=pore_mask.shape; vm=np.zeros_like(pore_mask,bool); area=0; tries=0
+    rng=np.random.default_rng(seed)
+    while area<want and tries<90000:
+        tries+=1; r=int(np.clip(rng.normal(3.0,1.2),1.0,6.0))
+        x=rng.integers(r,w-r); y=rng.integers(r,h-r)
+        if pore_mask[y,x]:
+            yy,xx=np.ogrid[-y:h-y,-x:w-x]; disk=(xx*xx+yy*yy)<=r*r
+            add=np.logical_and(disk,pore_mask); vm[add]=True; area=int(vm.sum())
+    return vm
 
-    st.divider()
-    st.markdown("Data / Models")
-    st.write("Source:", os.path.basename(src_path) if src_path else "—")
-    st.write("Rows:", f"{len(df_base):,}")
-    st.write("Models:", "trained" if models else "—")
+def _dt_scale(ax, fov_mm, length_um=500):
+    length_mm = length_um/1000.0
+    if length_mm >= fov_mm: return
+    pad = 0.06*fov_mm
+    x0 = fov_mm - pad - length_mm; x1 = fov_mm - pad
+    y = pad*0.6
+    ax.plot([x0,x1],[y,y], lw=3.0, color=_COLOR_BORDER)
+    ax.text((x0+x1)/2, y+0.02*fov_mm, f"{int(length_um)} µm",
+            ha="center", va="bottom", fontsize=9, color=_COLOR_BORDER)
 
-# ------------------------------- Balanced Top-5 -------------------------------
-def recommend_balanced_top5(material, d50_um, layer_um, target_green, guardrails_on, models, df_source):
-    gr = guardrail_ranges(d50_um, on=guardrails_on)
-    sat_lo, sat_hi = [float(x) for x in gr["binder_saturation_pct"]]
-    spd_lo, spd_hi = [float(x) for x in gr["roller_speed_mm_s"]]
+# ============================ PUBLIC ENTRY ====================================
+def render(material:str, d50_um:float, layer_um:float):
+    st.subheader("Digital Twin (Beta) — STL slice + qualitative packing")
 
-    def candidates(binder_type):
-        Xs = np.linspace(sat_lo, sat_hi, 36)
-        Ys = np.linspace(spd_lo, spd_hi, 28)
-        # IMPORTANT: include layer_thickness_um since shared.predict_quantiles expects it
-        g = pd.DataFrame([(b, v, float(layer_um), float(d50_um), material)
-                          for v in Ys for b in Xs],
-                         columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
-        pr = predict_quantiles(models, g)
-        g = g.join(pr[["td_q10","td_q50","td_q90"]])
-        g["binder_type_rec"] = binder_type
-        g["score"] = (g["td_q50"] - float(target_green)).abs() + 0.10*np.clip(float(target_green)-g["td_q10"], 0, None)
-        return g.sort_values("score", ascending=True)
+    if not (_HAVE_TRIMESH and _HAVE_SHAPELY):
+        st.error("Install 'trimesh' and 'shapely' to use this tab (see requirements.txt).")
+        return
 
-    gw = candidates("water_based")
-    gs = candidates("solvent_based")
+    # pull Top-5 from the main app (unchanged)
+    top5 = st.session_state.get("top5_recipes_df")
+    if top5 is None or getattr(top5, "empty", True):
+        st.info("Run your app’s Predict tab first to generate Top-5 recipes.")
+        return
+    top5 = top5.reset_index(drop=True)
 
-    pick_w = gw.head(3).copy()
-    pick_s = gs.head(2).copy()
-    if len(pick_w) < 3:
-        need = 3 - len(pick_w)
-        pick_w = pd.concat([pick_w, gw.iloc[len(pick_w):len(pick_w)+need]], ignore_index=True)
-    if len(pick_s) < 2:
-        need = 2 - len(pick_s)
-        pick_s = pd.concat([pick_s, gs.iloc[len(pick_s):len(pick_s)+need]], ignore_index=True)
+    L, R = st.columns([1.2, 1])
+    with L:
+        rec_id = st.selectbox("Pick one trial", list(top5["id"]), index=0)
+        picks  = st.multiselect("Compare trials", list(top5["id"]), default=list(top5["id"])[:3])
+    with R:
+        stl_units = st.selectbox("STL units", ["mm","m"], index=0)
+        um2unit = 1e-3 if stl_units=="mm" else 1e-6
+        pack_full = st.checkbox("Pack full slice (auto FOV)", value=True)
+        fov_mm = st.slider("Manual FOV (mm)", 0.5, 6.0, 1.5, 0.05, disabled=pack_full)
+        phi_TPD = st.slider("Target φ_TPD", 0.85, 0.95, 0.90, 0.01)
+        phi2D_target = float(np.clip(0.90*phi_TPD, 0.40, 0.88))
+        cap = st.slider("Visual cap (particles)", 200, 3000, 1500, 50)
+        fast = st.toggle("Fast mode (coarser packing)", value=True, help="Speeds up packing by limiting attempts")
 
-    out = pd.concat([pick_w, pick_s], ignore_index=True).reset_index(drop=True)
-    out = out.rename(columns={
-        "binder_saturation_pct":"saturation_pct",
-        "roller_speed_mm_s":"roller_speed",
-        "td_q50":"pred_q50","td_q10":"pred_q10","td_q90":"pred_q90",
-        "binder_type_rec":"binder_type"
-    })
-    out["layer_um"] = float(layer_um)
-    out["id"] = [f"Opt-{i+1}" for i in range(len(out))]
-    cols = ["id","binder_type","saturation_pct","roller_speed","layer_um","pred_q10","pred_q50","pred_q90","d50_um","material"]
-    return out[cols]
+    c1,c2,c3 = st.columns([2,1,1])
+    with c1: stl_file = st.file_uploader("Upload STL", type=["stl"])
+    with c2: use_cube = st.checkbox("Use built-in 10 mm cube", value=False)
+    with c3: show_mesh = st.checkbox("Show 3D mesh preview", value=True)
 
-# ------------------------------- Tabs -----------------------------------------
-tab_pred, tab_heat, tab_sens, tab_pack, tab_form, tab_twin, tab_health = st.tabs(
-    ["Predict (Top-5)", "Heatmap", "Saturation sensitivity", "Qualitative packing", "Formulae", "Digital Twin (Beta)", "Data health"]
-)
+    mesh=None
+    if use_cube:
+        mesh = trimesh.creation.box(extents=(10.0,10.0,10.0))
+    elif stl_file is not None:
+        mesh = _dt_load_mesh(stl_file.read())
 
-# ==============================================================================
-# Predict (Top-5)
-# ==============================================================================
-with tab_pred:
-    st.subheader("Top-5 parameter sets (3 aqueous + 2 solvent)")
-    recs = recommend_balanced_top5(material=material, d50_um=float(d50_um), layer_um=float(layer_um),
-                                   target_green=float(target_green), guardrails_on=guardrails_on,
-                                   models=models, df_source=df_base)
-    st.session_state["top5_recipes_df"] = recs.copy()
-    st.dataframe(recs, use_container_width=True, hide_index=True)
+    # use selected trial’s D50/layer if present; else fallback to sidebar values
+    rec = top5[top5["id"]==rec_id].iloc[0]
+    d50_r = float(rec.get("d50_um",  d50_um))
+    layer_r = float(rec.get("layer_um", layer_um))
+    diam_um = _dt_psd_um(7000 if fast else 10000, d50_r, seed=9991)
+    diam_units = diam_um * um2unit
 
-# ==============================================================================
-# Heatmap (q50 with smoothing) — include layer_thickness_um
-# ==============================================================================
-with tab_heat:
-    st.subheader("Predicted Green %TD (q50) — speed × saturation")
-    gr = guardrail_ranges(d50_um, on=guardrails_on)
-    sat_lo, sat_hi = gr["binder_saturation_pct"]; spd_lo, spd_hi = gr["roller_speed_mm_s"]
-    Xs = np.linspace(float(sat_lo), float(sat_hi), 85)
-    Ys = np.linspace(float(spd_lo), float(spd_hi), 70)
-
-    grid = pd.DataFrame([(b, v, float(layer_um), float(d50_um), material)
-                         for v in Ys for b in Xs],
-                        columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
-    pr = predict_quantiles(models, grid)
-    dfZ = pd.DataFrame({"sat": pr["binder_saturation_pct"], "spd": pr["roller_speed_mm_s"], "z": pr["td_q50"]}).astype(float)
-    Z = dfZ.pivot_table(index="spd", columns="sat", values="z").sort_index().sort_index(axis=1)
-
-    sigma = st.slider("Smoothing σ", 0.0, 2.0, 1.0, 0.1, help="Set to 0 for raw model output.")
-    Zv = Z.values.copy()
-    if sigma > 0: Zv = gaussian_filter(Zv, sigma=sigma, mode="nearest")
-
-    zmin, zmax = float(np.nanmin(Zv)), float(np.nanmax(Zv))
-    z0, z1 = max(40.0, zmin), min(100.0, zmax if zmax > zmin else zmin + 1.0)
-
-    fig = go.Figure()
-    fig.add_trace(go.Heatmap(z=Zv, x=Z.columns.values, y=Z.index.values, zmin=z0, zmax=z1,
-                             zsmooth="best", colorscale="Viridis",
-                             colorbar=dict(title="%TD (q50)", len=0.82)))
-    thr = float(target_green)
-    fig.add_trace(go.Contour(z=Zv, x=Z.columns.values, y=Z.index.values,
-                             contours=dict(start=thr,end=thr,size=1,coloring="lines"),
-                             line=dict(color="#C21807", dash="dash", width=3.0),
-                             showscale=False, hoverinfo="skip"))
-    fig.update_layout(xaxis_title="Binder Saturation (%)", yaxis_title="Roller Speed (mm/s)",
-                      margin=dict(l=10,r=20,t=30,b=35), height=470)
-    st.plotly_chart(fig, use_container_width=True)
-
-# ==============================================================================
-# Saturation sensitivity — include layer_thickness_um
-# ==============================================================================
-with tab_sens:
-    st.subheader("Saturation sensitivity at representative speed")
-    gr = guardrail_ranges(d50_um, on=guardrails_on)
-    v_mid = float((gr["roller_speed_mm_s"][0] + gr["roller_speed_mm_s"][1]) / 2.0)
-    sat_axis = np.linspace(float(gr["binder_saturation_pct"][0]), float(gr["binder_saturation_pct"][1]), 75)
-    grid = pd.DataFrame({
-        "binder_saturation_pct": sat_axis,
-        "roller_speed_mm_s": np.full_like(sat_axis, v_mid),
-        "layer_thickness_um": np.full_like(sat_axis, float(layer_um)),
-        "d50_um": np.full_like(sat_axis, float(d50_um)),
-        "material": [material]*len(sat_axis),
-    })
-    pred = predict_quantiles(models, grid)
-    q10,q50,q90 = pred["td_q10"].astype(float).values, pred["td_q50"].astype(float).values, pred["td_q90"].astype(float).values
-
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=sat_axis, y=q90, line=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip"))
-    fig2.add_trace(go.Scatter(x=sat_axis, y=q10, fill='tonexty', name="q10–q90", mode="lines",
-                              line=dict(color="rgba(56,161,105,0.0)"), fillcolor="rgba(56,161,105,0.22)"))
-    fig2.add_trace(go.Scatter(x=sat_axis, y=q50, name="q50 (median)", mode="lines", line=dict(width=3, color="#2563eb")))
-    fig2.update_layout(xaxis_title="Binder saturation (%)", yaxis_title="Predicted green %TD",
-                       height=420, margin=dict(l=10,r=10,t=10,b=10),
-                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    st.plotly_chart(fig2, use_container_width=True)
-
-# ==============================================================================
-# Qualitative packing (square window, illustrative)
-# ==============================================================================
-with tab_pack:
-    st.subheader("Qualitative packing (illustrative)")
-    if not HAVE_SHAPELY:
-        st.error("This view requires 'shapely'. Please add it to requirements.txt.")
+    # choose layer
+    if mesh is not None:
+        minz, maxz = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
+        thickness = layer_r * (1e-3 if stl_units=="mm" else 1e-6)
+        n_layers = max(1, int((maxz - minz) / max(thickness, 1e-12)))
+        st.caption(f"Layers: {n_layers} · Z span: {maxz-minz:.3f} {stl_units}")
+        layer_idx = st.slider("Layer index", 1, n_layers, min(5, n_layers))
+        z = minz + (layer_idx - 0.5) * thickness
     else:
-        frame_mm = 1.8; px = 1400
-        diam_um = sample_psd_um(6500, d50_um, None, None, seed=42)
-        diam_mm = diam_um / 1000.0
-        phi2D_target = float(np.clip(0.90 * (target_green/100.0), 0.40, 0.88))
-        dom = box(0, 0, frame_mm, frame_mm)
+        n_layers, layer_idx, z = 1, 1, 0.0
 
-        centers, radii, phi2D = pack_in_domain([dom], diam_mm, phi2D_target,
-                                               max_particles=2600, max_trials=600_000, seed=1001)
+    if mesh is not None and show_mesh:
+        import plotly.graph_objects as go
+        figm = go.Figure(data=[go.Mesh3d(
+            x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
+            i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
+            color="lightgray", opacity=0.55, flatshading=True, name="Part"
+        )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=0,b=0), height=360)
+        st.plotly_chart(figm, use_container_width=True)
 
-        pores = ~raster_mask(centers, radii, frame_mm, px)
-        sat_frac = float(np.clip(target_green/100.0, 0.6, 0.98))
-        vmask = voids_from_saturation(pores, saturation=sat_frac)
+    # build slice polygon(s) and local packing domain
+    if mesh is not None and _HAVE_SHAPELY:
+        polys_world = _dt_slice_polys(mesh, z)
+        if pack_full and polys_world:
+            dom = unary_union(polys_world)
+            xmin, ymin, xmax, ymax = dom.bounds
+            fov = max(xmax-xmin, ymax-ymin)
+            win = box(xmin, ymin, xmin+fov, ymin+fov)
+            polys_clip = [dom.intersection(win)]
+            polys_local = _dt_to_local(polys_clip, (xmin, ymin))
+            render_fov = fov
+        else:
+            polys_clip, origin = _dt_crop_to_fov(polys_world, float(fov_mm))
+            polys_local = _dt_to_local(polys_clip, origin)
+            render_fov = float(fov_mm)
+    else:
+        # fallback: square window if no STL
+        half = (1.8)/2.0
+        polys_local=[box(0,0,2*half,2*half)]
+        render_fov = 2*half
 
-        fig, ax = plt.subplots(figsize=(8, 8), dpi=180)
-        ax.add_patch(Rectangle((0, 0), frame_mm, frame_mm, facecolor=binder_color("water_based"),
-                               edgecolor=BORDER, linewidth=1.2))
-        ys, xs = np.where(vmask)
-        if len(xs):
-            xm = xs * (frame_mm/vmask.shape[1]); ym = (vmask.shape[0]-ys) * (frame_mm/vmask.shape[0])
-            ax.scatter(xm, ym, s=0.25, c=VOID, alpha=0.95, linewidths=0)
+    # pack
+    centers, radii, phi2D = _dt_pack(
+        polys_local, diam_units, phi2D_target,
+        max_particles=int(cap),
+        max_trials=200_000 if fast else 480_000,
+        seed=20_000 + layer_idx
+    )
+
+    # render two panels
+    def _panel_particles(ax):
+        ax.add_patch(Rectangle((0,0), render_fov, render_fov, facecolor="white", edgecolor=_COLOR_BORDER, linewidth=1.2))
         for (x,y), r in zip(centers, radii):
-            ax.add_patch(Circle((x,y), r, facecolor=PARTICLE, edgecolor=EDGE, linewidth=0.25))
-        ax.set_aspect('equal','box'); ax.set_xlim(0, frame_mm); ax.set_ylim(0, frame_mm)
+            ax.add_patch(Circle((x,y), r, facecolor=_COLOR_PARTICLE, edgecolor=_COLOR_EDGE, linewidth=0.25))
+        ax.set_aspect('equal','box'); ax.set_xlim(0,render_fov); ax.set_ylim(0,render_fov)
         ax.set_xticks([]); ax.set_yticks([])
-        draw_scale_bar(ax, frame_mm, length_um=500)
-        ax.set_title(f"D50≈{d50_um:.0f} µm · Sat≈{int(sat_frac*100)}% · Layer≈{layer_um:.0f} µm",
-                     fontsize=10, pad=10)
-        st.pyplot(fig, clear_figure=True)
 
-# ==============================================================================
-# Formulae (placeholder)
-# ==============================================================================
-with tab_form:
-    st.subheader("Formulae")
-    st.write("Add your reference equations/notes here (kept for continuity with the original app).")
+    def _panel_binder(ax, sat_pct, binder):
+        px=900; pores=~_dt_bitmap_mask(centers, radii, render_fov, px)
+        vm=_dt_voids(pores, sat=float(sat_pct)/100.0, seed=1234)
+        ax.add_patch(Rectangle((0,0), render_fov, render_fov, facecolor=_binder_hex(binder), edgecolor=_COLOR_BORDER, linewidth=1.2))
+        ys,xs=np.where(vm)
+        if len(xs):
+            xm=xs*(render_fov/vm.shape[1]); ym=(vm.shape[0]-ys)*(render_fov/vm.shape[0])
+            ax.scatter(xm, ym, s=0.32, c=_COLOR_VOID, alpha=0.96, linewidth=0)
+        for (x,y), r in zip(centers, radii):
+            ax.add_patch(Circle((x,y), r, facecolor=_COLOR_PARTICLE, edgecolor=_COLOR_EDGE, linewidth=0.25))
+        ax.set_aspect('equal','box'); ax.set_xlim(0,render_fov); ax.set_ylim(0,render_fov); ax.set_xticks([]); ax.set_yticks([])
 
-# ==============================================================================
-# Digital Twin (Beta) — STL slicing + recipe-true packing
-# ==============================================================================
-with tab_twin:
-    st.subheader("Digital Twin — recipe-true layer preview")
+    # single trial (respects main app’s Top-5)
+    rec = top5[top5["id"]==rec_id].iloc[0]
+    sat_pct = float(rec.get("saturation_pct", 85.0))
+    binder  = str(rec.get("binder_type","water_based"))
 
-    if not (HAVE_TRIMESH and HAVE_SHAPELY):
-        st.error("Digital Twin needs 'trimesh' and 'shapely' (see requirements.txt).")
-    else:
-        top5 = st.session_state.get("top5_recipes_df")
-        if top5 is None or getattr(top5, "empty", True):
-            st.info("Run the Predict tab first to generate Top-5 recipes.")
-        else:
-            top5 = top5.reset_index(drop=True).copy()
-            cfast, cmesh = st.columns([1,1])
-            with cfast:
-                fast_mode = st.toggle("Fast mode (recommended)", value=True)
-            with cmesh:
-                show_mesh = st.toggle("Show 3D mesh preview", value=not fast_mode)
+    cA,cB = st.columns(2)
+    with cA:
+        figA, axA = plt.subplots(figsize=(5.1,5.1), dpi=185)
+        _panel_particles(axA)
+        _dt_scale(axA, render_fov)
+        axA.set_title("Particles only", fontsize=10)
+        st.pyplot(figA, use_container_width=True)
+    with cB:
+        figB, axB = plt.subplots(figsize=(5.1,5.1), dpi=185)
+        _panel_binder(axB, sat_pct, binder)
+        _dt_scale(axB, render_fov)
+        axB.set_title(f"{binder} · Sat {int(sat_pct)}%", fontsize=10)
+        st.pyplot(figB, use_container_width=True)
 
-            left,right = st.columns([1.2,1])
-            with left:
-                rec_id = st.selectbox("Pick one trial", list(top5["id"]), index=0)
-            with right:
-                stl_units = st.selectbox("STL units", ["mm","m"], index=0)
-                um2unit = 1e-3 if stl_units=="mm" else 1e-6
+    st.caption(f"FOV={render_fov:.2f} mm · φ₂D(target)≈{phi2D_target:.2f} · φ₂D(achieved)≈{min(phi2D,1.0):.2f} · Porosity₂D≈{max(0.0,1.0-phi2D):.2f}")
 
-            c1,c2,c3 = st.columns([2,1,1])
-            with c1: stl_file = st.file_uploader("Upload STL", type=["stl"])
-            with c2: pack_full = st.checkbox("Pack full slice (auto FOV)", value=True)
-            with c3: cap = st.slider("Visual cap (particles)", 200, 4000, 1200 if fast_mode else 2200, 50)
-
-            rec = top5[top5["id"]==rec_id].iloc[0]
-            d50_r   = float(rec.get("d50_um",  d50_um))
-            layer_r = float(rec.get("layer_um", layer_um))
-            sat_pct = float(rec.get("saturation_pct", 85.0))
-            binder  = str(rec.get("binder_type","water_based"))
-
-            phi2D_target = float(np.clip(0.90 * (sat_pct/100.0 + 0.05), 0.40, 0.88))
-            diam_um   = sample_psd_um(9000 if not fast_mode else 5000, d50_r, None, None, seed=9991)
-            diam_unit = diam_um * um2unit
-
-            mesh=None
-            if stl_file is not None:
-                try:
-                    mesh = trimesh.load(io.BytesIO(stl_file.read()), file_type="stl", force="mesh", process=False)
-                    if not isinstance(mesh, trimesh.Trimesh):
-                        mesh = mesh.dump(concatenate=True)
-                except Exception as e:
-                    st.error(f"Could not read STL: {e}")
-            else:
-                st.info("No STL — using a centered square FOV for microstructure.")
-
-            if mesh is not None:
-                minz, maxz = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
-                thickness = layer_r * (1e-3 if stl_units=="mm" else 1e-6)
-                n_layers = max(1, int((maxz - minz) / max(thickness, 1e-12)))
-                st.caption(f"Layers: {n_layers} · Z span: {maxz-minz:.3f} {stl_units}")
-                layer_idx = st.slider("Layer index", 1, n_layers, min(5, n_layers))
-                z = minz + (layer_idx - 0.5) * thickness
-                if show_mesh:
-                    figm = go.Figure(data=[go.Mesh3d(
-                        x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
-                        i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
-                        color="lightgray", opacity=0.55, flatshading=True, name="Part"
-                    )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=0,b=0), height=360)
-                    st.plotly_chart(figm, use_container_width=True)
-                polys_world = slice_polys(mesh, z)
-            else:
-                polys_world = []
-                n_layers, layer_idx, z = 1, 1, 0.0
-
-            if pack_full and polys_world:
-                dom = unary_union(polys_world)
-                xmin, ymin, xmax, ymax = dom.bounds
-                fov_x = xmax - xmin; fov_y = ymax - ymin
-                fov = max(fov_x, fov_y)
-                win = box(xmin, ymin, xmin+fov, ymin+fov)
-                clip = dom.intersection(win)
-                geoms = [clip] if isinstance(clip, Polygon) else [g for g in clip.geoms if g.area > 1e-9]
-                origin = (xmin, ymin)
-                polys_local = to_local(geoms, origin)
-                render_fov = fov
-            else:
-                default_fov = max(0.80, 0.02 * d50_r)
-                fov_mm = st.slider("Field of view (mm)", float(max(0.20, 0.02 * d50_r)), 6.0, float(default_fov), 0.05)
-                if polys_world:
-                    polys_clip, origin = crop_window(polys_world, float(fov_mm))
-                    polys_local = to_local(polys_clip, origin)
-                else:
-                    half=fov_mm/2.0; polys_local=[box(0,0,2*half,2*half)]
-                render_fov = float(fov_mm)
-
-            centers, radii, phi2D = pack_in_domain(polys_local, diam_unit, phi2D_target,
-                                                   max_particles=int(cap),
-                                                   max_trials=300_000 if fast_mode else 480_000,
-                                                   seed=20_000 + (0 if mesh is None else layer_idx))
-
-            col1, col2 = st.columns(2)
-            with col1:
-                figA, axA = plt.subplots(figsize=(5.2,5.2), dpi=170 if fast_mode else 188)
-                axA.add_patch(Rectangle((0,0), render_fov, render_fov, facecolor="white",
-                                        edgecolor=BORDER, linewidth=1.2))
-                for (x,y), r in zip(centers, radii):
-                    axA.add_patch(Circle((x,y), r, facecolor=PARTICLE, edgecolor=EDGE, linewidth=0.25))
-                axA.set_aspect('equal','box'); axA.set_xlim(0,render_fov); axA.set_ylim(0,render_fov); axA.set_xticks([]); axA.set_yticks([])
-                draw_scale_bar(axA, render_fov)
-                axA.set_title("Particles only", fontsize=10)
-                st.pyplot(figA, use_container_width=True)
-
-            with col2:
-                px = 680 if fast_mode else 900
-                pores = ~raster_mask(centers, radii, render_fov, px)
-                vmask = voids_from_saturation(pores, saturation=float(sat_pct)/100.0,
-                                             rng=np.random.default_rng(123 + (0 if mesh is None else layer_idx)))
-                figB, axB = plt.subplots(figsize=(5.2,5.2), dpi=170 if fast_mode else 188)
-                axB.add_patch(Rectangle((0,0), render_fov, render_fov,
-                                        facecolor=binder_color(binder), edgecolor=BORDER, linewidth=1.2))
-                ys, xs = np.where(vmask)
-                if len(xs):
-                    xm = xs * (render_fov/vmask.shape[1]); ym = (vmask.shape[0]-ys) * (render_fov/vmask.shape[0])
-                    axB.scatter(xm, ym, s=0.32 if not fast_mode else 0.28, c=VOID, alpha=0.96, linewidth=0)
-                for (x,y), r in zip(centers, radii):
-                    axB.add_patch(Circle((x,y), r, facecolor=PARTICLE, edgecolor=EDGE, linewidth=0.25))
-                axB.set_aspect('equal','box'); axB.set_xlim(0,render_fov); axB.set_ylim(0,render_fov); axB.set_xticks([]); axB.set_yticks([])
-                draw_scale_bar(axB, render_fov)
-                axB.set_title(f"{binder} · Sat {int(sat_pct)}%", fontsize=10)
-                st.pyplot(figB, use_container_width=True)
-
-            st.caption(f"FOV={render_fov:.2f} mm · φ₂D(target)≈{phi2D_target:.2f} · φ₂D(achieved)≈{min(phi2D,1.0):.2f} · Porosity₂D≈{max(0.0,1.0-phi2D):.2f}")
-
-# ==============================================================================
-# Data health — coverage & ≥90%TD evidence near D50
-# ==============================================================================
-with tab_health:
-    st.subheader("Training coverage & ≥90%TD evidence near this D50")
-    d = df_base.copy()
-    if "material" in d.columns:
-        d = d[d["material"].astype(str)==str(material)]
-    if "d50_um" in d.columns:
-        lo, hi = 0.8*float(d50_um), 1.2*float(d50_um)
-        d = d[(d["d50_um"]>=lo) & (d["d50_um"]<=hi)]
-    c1, c2 = st.columns([1,2])
-    with c1:
-        if "green_pct_td" in d.columns:
-            st.metric("Rows in ±20% D50 window", len(d))
-            st.metric("Seen ≥90%TD cases", int((d["green_pct_td"]>=90).sum()))
-            if len(d): st.metric("Best %TD", f"{float(d['green_pct_td'].max()):.1f}")
-        else:
-            st.info("No green %TD column found after normalization.")
-    with c2:
-        if not d.empty and "d50_um" in d.columns and "green_pct_td" in d.columns:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=d["d50_um"], y=d["green_pct_td"], mode="markers", name="train pts"))
-            fig.add_hline(y=90, line=dict(color="#C21807", dash="dash"))
-            fig.update_layout(xaxis_title="D50 (µm)", yaxis_title="Green %TD",
-                              height=360, margin=dict(l=10,r=10,t=10,b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No training points in this window.")
+    # compare multiple trials visually (same slice/particles; binder & sat vary)
+    if picks:
+        cols = st.columns(min(3, len(picks)))
+        for i, rid in enumerate(picks[:len(cols)]):
+            row = top5[top5["id"]==rid].iloc[0]
+            sat = float(row.get("saturation_pct", 85.0)); bndr=str(row.get("binder_type","water_based"))
+            figC, axC = plt.subplots(figsize=(4.9,4.9), dpi=185)
+            _panel_binder(axC, sat, bndr)
+            _dt_scale(axC, render_fov)
+            axC.set_title(f'{row["id"]}: {bndr} · Sat {int(sat)}%', fontsize=9)
+            with cols[i]:
+                st.pyplot(figC, use_container_width=True)
