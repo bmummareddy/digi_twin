@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# digital_twin.py — STL slice → centered square FOV → fast RSA packing → binder/void render
+# digital_twin.py — OPTIMIZED: Full STL view + visible particle size distribution
+# Fixes: (1) Shows entire cross-section with 10% margin, (2) Wider PSD (sigma=0.40) for visual variety
 
 from __future__ import annotations
 import io, math
@@ -9,7 +10,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
-from PIL import Image  # only to keep pillow in reqs; not used for raster anymore
+from PIL import Image
 
 # --------------------------- Optional/required deps ---------------------------
 try:
@@ -51,12 +52,18 @@ def _binder_hex(name: str) -> str:
     if "solvent" in k: return BINDER_COLORS["solvent_based"]
     return BINDER_COLORS["other"]
 
-# ------------------------------- PSD sampling --------------------------------
+# ------------------------------- PSD sampling (OPTIMIZED) --------------------
 def _psd_um(n: int, d50_um: float, seed: int) -> np.ndarray:
+    """
+    Generate particle size distribution with WIDER variance for visual variety.
+    Uses lognormal with sigma=0.40 (was 0.25) and wider clipping range.
+    """
     rng = np.random.default_rng(seed)
-    mu, sigma = np.log(max(d50_um, 1e-6)), 0.25
+    mu = np.log(max(d50_um, 1e-6))
+    sigma = 0.40  # INCREASED from 0.25 for more visible size variation
     d = np.exp(rng.normal(mu, sigma, size=n))
-    return np.clip(d, 0.30*d50_um, 3.00*d50_um)
+    # WIDER clipping range: 0.15x to 4.0x (was 0.30x to 3.0x)
+    return np.clip(d, 0.15*d50_um, 4.0*d50_um)
 
 # ----------------------------- Mesh I/O + slicing ----------------------------
 @st.cache_resource(show_spinner=False)
@@ -156,7 +163,7 @@ def _void_mask_from_saturation(pore_mask: np.ndarray, saturation: float, seed: i
 
 def _pack(polys_wkb_list: List[bytes], diam_units: np.ndarray, phi_target: float,
           max_particles: int, max_trials: int, seed: int) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Greedy RSA with a small spatial grid and per-size attempt cap (fast)."""
+    """Greedy RSA with spatial grid and adaptive attempt cap."""
     if not (HAVE_SHAPELY and polys_wkb_list):
         return np.empty((0, 2)), np.empty((0,)), 0.0
 
@@ -198,7 +205,7 @@ def _pack(polys_wkb_list: List[bytes], diam_units: np.ndarray, phi_target: float
             continue
         fx0, fy0, fx1, fy1 = fit.bounds
 
-        # more attempts for large radii, fewer for small + when nearly done
+        # Adaptive attempts based on particle size
         per_size = 360 if r >= med_r else 200
         if (target_area - area_circ) / target_area < 0.08:
             per_size = 120
@@ -241,7 +248,7 @@ def _scale_bar(ax, fov_mm: float, length_um: int = 500):
 # --------------------------------- Public UI ----------------------------------
 def render(material: str, d50_um: float, layer_um: float):
     """Render the Digital Twin tab; callable from streamlit_app.py"""
-    st.subheader("Digital Twin — STL slice + qualitative packing")
+    st.subheader("Digital Twin — Full STL view + particle size distribution")
 
     if not (HAVE_TRIMESH and HAVE_SHAPELY):
         miss = []
@@ -250,7 +257,7 @@ def render(material: str, d50_um: float, layer_um: float):
         st.error("Missing deps: " + ", ".join(miss))
         return
 
-    # pull Top-5 (from your main app); we won't fail if absent
+    # pull Top-5 (from main app)
     top5 = st.session_state.get("top5_recipes_df")
     if top5 is not None and not getattr(top5, "empty", True):
         top5 = top5.reset_index(drop=True)
@@ -270,17 +277,21 @@ def render(material: str, d50_um: float, layer_um: float):
         stl_units = st.selectbox("STL units", ["mm", "m"], index=0)
         um2unit = 1e-3 if stl_units == "mm" else 1e-6
 
-        pack_full = st.checkbox("Pack full slice (auto square FOV)", value=True)
-        pack_scope = st.selectbox(
-            "Packing scope", ["Part only", "Build box (FOV)"], index=0,
-            help="Part only = pack within part cross-section; Build box = fill square FOV."
+        view_mode = st.selectbox(
+            "View mode",
+            ["Full cross-section (auto FOV)", "Manual FOV crop"],
+            index=0,
+            help="Full cross-section shows entire part slice; Manual FOV lets you zoom in"
         )
+        
+        fov_mm = st.slider("Manual FOV (mm)", 0.5, 20.0, 3.0, 0.05, 
+                          disabled=(view_mode.startswith("Full")))
 
-        fov_mm = st.slider("Manual FOV (mm)", 0.5, 20.0, 3.0, 0.05, disabled=pack_full)
         phi_TPD = st.slider("Target φ_TPD", 0.85, 0.95, 0.90, 0.01)
-        phi2D_target = float(np.clip(0.95 * phi_TPD, 0.45, 0.90))  # stronger mapping than 0.90*φ_TPD
+        phi2D_target = float(np.clip(0.95 * phi_TPD, 0.45, 0.90))
 
-        fast = st.toggle("Fast mode (coarser packing)", value=True, help="Limits tries and sizes to speed up")
+        fast = st.toggle("Fast mode (coarser packing)", value=True, 
+                        help="Limits tries and sizes to speed up")
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
@@ -296,7 +307,7 @@ def render(material: str, d50_um: float, layer_um: float):
         d50_r   = float(row.get("d50_um",  d50_um))
         layer_r = float(row.get("layer_um", layer_um))
         sat_pct = float(row.get("saturation_pct", 80.0))
-        binder  = str(  row.get("binder_type", "water_based"))
+        binder  = str(row.get("binder_type", "water_based"))
     else:
         d50_r, layer_r, sat_pct, binder = float(d50_um), float(layer_um), 80.0, "water_based"
 
@@ -310,9 +321,9 @@ def render(material: str, d50_um: float, layer_um: float):
     # layer selection
     if mesh is not None:
         minz, maxz = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
-        thickness = layer_r * (1e-3 if stl_units == "mm" else 1e-6)
+        thickness = layer_r * um2unit
         n_layers = max(1, int((maxz - minz) / max(thickness, 1e-12)))
-        st.caption(f"Layers: {n_layers} · Z span: {maxz - minz:.3f} {stl_units}")
+        st.caption(f"**Layers: {n_layers}** · Z span: [{minz:.3f}, {maxz:.3f}] {stl_units} · Thickness: {thickness:.4f}")
         layer_idx = st.slider("Layer index", 1, n_layers, min(5, n_layers))
         z = minz + (layer_idx - 0.5) * thickness
     else:
@@ -329,27 +340,45 @@ def render(material: str, d50_um: float, layer_um: float):
         )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0, r=0, t=0, b=0), height=360)
         st.plotly_chart(figm, use_container_width=True)
 
-    # slice → centered square FOV → local polygons
+    # ==================== OPTIMIZED FOV CALCULATION ====================
+    # FIX: Create bounding square that shows ENTIRE cross-section
     if mesh is not None and HAVE_SHAPELY:
         verts = mesh.vertices.astype(np.float64, copy=False)
         faces = mesh.faces.astype(np.int64, copy=False)
-        key = (verts.size, faces.size)  # cache key for this mesh
+        key = (verts.size, faces.size)
         polys_wkb = _slice_at_z(key, verts.tobytes(), faces.tobytes(), float(z))
 
         if polys_wkb:
             dom = unary_union([wkb.loads(p) for p in polys_wkb])
             xmin, ymin, xmax, ymax = dom.bounds
-            side = max(xmax - xmin, ymax - ymin)
-            cx, cy = dom.centroid.x, dom.centroid.y
-            half = side / 2.0
-            square_auto = box(cx - half, cy - half, cx + half, cy + half)
-
-            win = square_auto if pack_full else box(cx - fov_mm/2, cy - fov_mm/2, cx + fov_mm/2, cy + fov_mm/2)
-            clipped = dom.intersection(win)
-            geoms = [clipped] if isinstance(clipped, Polygon) else [g for g in clipped.geoms if isinstance(g, Polygon)]
+            
+            if view_mode.startswith("Full"):
+                # OPTIMIZED: Use actual bounding box with 10% margin
+                width = xmax - xmin
+                height = ymax - ymin
+                side = max(width, height) * 1.10  # 10% margin for visibility
+                
+                # Center the square on the part centroid
+                cx, cy = dom.centroid.x, dom.centroid.y
+                half = side / 2.0
+                win = box(cx - half, cy - half, cx + half, cy + half)
+                
+                # Clip part to window
+                clipped = dom.intersection(win)
+            else:
+                # Manual FOV mode
+                cx, cy = dom.centroid.x, dom.centroid.y
+                half_fov = fov_mm / 2.0
+                win = box(cx - half_fov, cy - half_fov, cx + half_fov, cy + half_fov)
+                clipped = dom.intersection(win)
+            
+            # Convert to list of polygons
+            geoms = [clipped] if isinstance(clipped, Polygon) else \
+                    [g for g in clipped.geoms if isinstance(g, Polygon)]
             polys_clip_wkb = [g.wkb for g in geoms]
 
-            ox, oy, _, _ = win.bounds
+            # Convert to local coordinates (origin at window lower-left)
+            ox, oy = win.bounds[0], win.bounds[1]
             def _to_local_wkb(pw):
                 p = wkb.loads(pw)
                 x, y = p.exterior.xy
@@ -357,98 +386,138 @@ def render(material: str, d50_um: float, layer_um: float):
 
             polys_local = [_to_local_wkb(pw) for pw in polys_clip_wkb]
             render_fov = float(win.bounds[2] - win.bounds[0])
+            
+            st.success(f"✅ Layer {layer_idx}: Showing full cross-section ({render_fov:.2f} mm FOV)")
         else:
-            # empty slice
-            side = float(fov_mm if not pack_full else 2.0)
+            # Empty slice
+            st.warning(f"⚠️ No geometry at layer {layer_idx} (Z={z:.4f})")
+            side = 2.0
             polys_local = [box(0, 0, side, side).wkb]
             render_fov = side
     else:
-        side = float(fov_mm if not pack_full else 2.0)
+        # No mesh - fallback
+        side = float(fov_mm if view_mode.startswith("Manual") else 2.0)
         polys_local = [box(0, 0, side, side).wkb]
         render_fov = side
 
-    # if user wants “build box”, ignore part mask and fill entire square
-    if pack_scope.endswith("FOV"):
-        polys_local = [box(0, 0, render_fov, render_fov).wkb]
+    # ==================== PARTICLE PACKING ====================
+    # Dynamic particle cap based on FOV and D50
+    est = (render_fov * 1000.0 / max(d50_r, 1e-6))**2 * 0.35
+    cap = int(np.clip(est, 1000, 5000))
 
-    # dynamic particle cap ~ (FOV / D50)^2 scaled
-    est = (render_fov * 1000.0 / max(d50_r, 1e-6))**2 * 0.32
-    cap = int(np.clip(est, 900, 4500))
-
-    # PSD resolution (fast mode fewer sizes)
-    n_psd = 7000 if fast else 10000
+    # Generate PSD with WIDER distribution for visual variety
+    n_psd = 8000 if fast else 12000
     diam_um = _psd_um(n_psd, d50_r, seed=9991)
-    diam_units = diam_um * (1e-3 if stl_units == "mm" else 1e-6)
+    diam_units = diam_um * um2unit
 
+    # Pack particles
     centers, radii, phi2D = _pack(
         polys_local, diam_units, phi2D_target,
-        max_particles=cap, max_trials=(200_000 if fast else 480_000),
+        max_particles=cap, max_trials=(220_000 if fast else 500_000),
         seed=20_000 + int(layer_idx),
     )
 
-    # panels
+    if len(centers) == 0:
+        st.error("⚠️ No particles packed! Try increasing FOV or reducing D50.")
+        return
+
+    # Show particle size statistics
+    if len(radii) > 0:
+        diams_placed = radii * 2.0 * (1000.0 / um2unit)  # Convert to µm
+        st.caption(f"**Particles placed: {len(centers)}** · "
+                  f"Sizes: {diams_placed.min():.1f}-{diams_placed.max():.1f} µm · "
+                  f"Median: {np.median(diams_placed):.1f} µm")
+
+    # ==================== VISUALIZATION ====================
     cA, cB = st.columns(2)
 
     with cA:
-        figA, axA = plt.subplots(figsize=(5.2, 5.2), dpi=185)
+        figA, axA = plt.subplots(figsize=(5.3, 5.3), dpi=190)
         axA.add_patch(Rectangle((0, 0), render_fov, render_fov, facecolor="white",
                                 edgecolor=COLOR_BORDER, linewidth=1.2))
         for (x, y), r in zip(centers, radii):
-            axA.add_patch(Circle((x, y), r, facecolor=COLOR_PARTICLE, edgecolor=COLOR_EDGE, linewidth=0.25))
-        axA.set_aspect('equal', 'box'); axA.set_xlim(0, render_fov); axA.set_ylim(0, render_fov)
-        axA.set_xticks([]); axA.set_yticks([])
+            axA.add_patch(Circle((x, y), r, facecolor=COLOR_PARTICLE, 
+                                edgecolor=COLOR_EDGE, linewidth=0.25))
+        axA.set_aspect('equal', 'box')
+        axA.set_xlim(0, render_fov)
+        axA.set_ylim(0, render_fov)
+        axA.set_xticks([])
+        axA.set_yticks([])
         _scale_bar(axA, render_fov)
-        axA.set_title("Particles only", fontsize=12)
+        axA.set_title("Particles only", fontsize=11)
         st.pyplot(figA, use_container_width=True)
 
     with cB:
         px = 900
         pores = ~_bitmap_mask_vectorized(centers, radii, render_fov, px)
-        vmask = _void_mask_from_saturation(pores, saturation=sat_pct/100.0, seed=1234 + int(layer_idx))
+        vmask = _void_mask_from_saturation(pores, saturation=sat_pct/100.0, 
+                                           seed=1234 + int(layer_idx))
 
-        figB, axB = plt.subplots(figsize=(5.2, 5.2), dpi=185)
+        figB, axB = plt.subplots(figsize=(5.3, 5.3), dpi=190)
         axB.add_patch(Rectangle((0, 0), render_fov, render_fov,
-                                facecolor=_binder_hex(binder), edgecolor=COLOR_BORDER, linewidth=1.2))
+                                facecolor=_binder_hex(binder), 
+                                edgecolor=COLOR_BORDER, linewidth=1.2))
         ys, xs = np.where(vmask)
         if len(xs):
             xm = xs * (render_fov / vmask.shape[1])
             ym = (vmask.shape[0] - ys) * (render_fov / vmask.shape[0])
             axB.scatter(xm, ym, s=0.32, c=COLOR_VOID, alpha=0.96, linewidth=0)
         for (x, y), r in zip(centers, radii):
-            axB.add_patch(Circle((x, y), r, facecolor=COLOR_PARTICLE, edgecolor=COLOR_EDGE, linewidth=0.25))
-        axB.set_aspect('equal', 'box'); axB.set_xlim(0, render_fov); axB.set_ylim(0, render_fov)
-        axB.set_xticks([]); axB.set_yticks([])
+            axB.add_patch(Circle((x, y), r, facecolor=COLOR_PARTICLE, 
+                                edgecolor=COLOR_EDGE, linewidth=0.25))
+        axB.set_aspect('equal', 'box')
+        axB.set_xlim(0, render_fov)
+        axB.set_ylim(0, render_fov)
+        axB.set_xticks([])
+        axB.set_yticks([])
         _scale_bar(axB, render_fov)
-        axB.set_title(f"{binder} · Sat {int(sat_pct)}%", fontsize=12)
+        axB.set_title(f"{binder} · Sat {int(sat_pct)}%", fontsize=11)
+        # Add legend
+        axB.text(0.02*render_fov, 0.97*render_fov, "SiC", 
+                color=COLOR_PARTICLE, fontsize=9, va="top")
+        axB.text(0.12*render_fov, 0.97*render_fov, "Binder", 
+                color="#805a00", fontsize=9, va="top")
+        axB.text(0.24*render_fov, 0.97*render_fov, "Void", 
+                color="#666", fontsize=9, va="top")
         st.pyplot(figB, use_container_width=True)
 
     st.caption(
-        f"FOV={render_fov:.2f} mm · φ₂D(target)≈{phi2D_target:.2f} · "
-        f"φ₂D(achieved)≈{min(phi2D,1.0):.2f} · Porosity₂D≈{max(0.0,1.0-float(phi2D)):.2f}"
+        f"⚡ **Layer {layer_idx}** · FOV={render_fov:.2f} mm · "
+        f"φ₂D(target)≈{phi2D_target:.2f} · φ₂D(achieved)≈{min(phi2D,1.0):.2f} · "
+        f"Porosity₂D≈{max(0.0,1.0-float(phi2D)):.2f}"
     )
 
-    # optional comparison (uses same particle layout; binder & sat vary)
-    if top5 is not None and picks:
+    # ==================== COMPARISON VIEW ====================
+    if top5 is not None and picks and len(picks) > 0:
+        st.subheader("Compare trials")
         cols = st.columns(min(3, len(picks)))
         for i, rid in enumerate(picks[:len(cols)]):
             row = top5[top5["id"] == rid].iloc[0]
             sat = float(row.get("saturation_pct", 80.0))
             bnd = str(row.get("binder_type", "water_based"))
-            px = 780
+            
+            px = 800
             pores = ~_bitmap_mask_vectorized(centers, radii, render_fov, px)
-            vm = _void_mask_from_saturation(pores, saturation=sat/100.0, seed=987 + int(layer_idx))
-            figC, axC = plt.subplots(figsize=(5.0, 5.0), dpi=185)
+            vm = _void_mask_from_saturation(pores, saturation=sat/100.0, 
+                                           seed=987 + int(layer_idx) + i)
+            
+            figC, axC = plt.subplots(figsize=(5.0, 5.0), dpi=180)
             axC.add_patch(Rectangle((0, 0), render_fov, render_fov,
-                                    facecolor=_binder_hex(bnd), edgecolor=COLOR_BORDER, linewidth=1.2))
+                                    facecolor=_binder_hex(bnd), 
+                                    edgecolor=COLOR_BORDER, linewidth=1.2))
             ys, xs = np.where(vm)
             if len(xs):
                 xm = xs * (render_fov / vm.shape[1])
                 ym = (vm.shape[0] - ys) * (render_fov / vm.shape[0])
                 axC.scatter(xm, ym, s=0.30, c=COLOR_VOID, alpha=0.96, linewidth=0)
             for (x, y), r in zip(centers, radii):
-                axC.add_patch(Circle((x, y), r, facecolor=COLOR_PARTICLE, edgecolor=COLOR_EDGE, linewidth=0.25))
-            axC.set_aspect('equal', 'box'); axC.set_xlim(0, render_fov); axC.set_ylim(0, render_fov)
-            axC.set_xticks([]); axC.set_yticks([])
+                axC.add_patch(Circle((x, y), r, facecolor=COLOR_PARTICLE, 
+                                    edgecolor=COLOR_EDGE, linewidth=0.25))
+            axC.set_aspect('equal', 'box')
+            axC.set_xlim(0, render_fov)
+            axC.set_ylim(0, render_fov)
+            axC.set_xticks([])
+            axC.set_yticks([])
             axC.set_title(f'{row["id"]}: {bnd} · Sat {int(sat)}%', fontsize=10)
             with cols[i]:
                 st.pyplot(figC, use_container_width=True)
