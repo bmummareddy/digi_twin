@@ -9,7 +9,7 @@ scikit-learn>=1.5,<1.6
 pyarrow>=15,<23
 
 # Viz
-plotly>=5.24,<5.25
+plotly>=5.22
 matplotlib>=3.9,<3.10
 Pillow>=10.3,<11
 altair>=5.2,<6
@@ -22,4 +22,9 @@ networkx>=3.3,<3.4
 # Logs (optional)
 rich>=13.9,<14
 protobuf<5
+
+
+
+
+
 
