@@ -1,10 +1,8 @@
-# streamlit_app.py — BJAM Binder-Jet AM Recommender (+ Digital Twin tab)
-# - Keeps your original UI/flow
-# - Adds a new tab that calls digital_twin.render(...)
-# - Expects shared.py and digital_twin.py in the same folder
+# streamlit_app.py — BJAM Binder-Jet AM Recommender (+ Digital Twin)
+# Tightened guardrails applied locally (no change to shared.py)
+# Improved heatmap visualization
 
 from __future__ import annotations
-
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -16,7 +14,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import streamlit as st
 
-# Project utilities from your repo
+# --- Project utilities (unchanged signatures in shared.py) ---
 from shared import (
     load_dataset,
     train_green_density_models,
@@ -27,7 +25,7 @@ from shared import (
     suggest_binder_family,
 )
 
-# NEW: import the Digital Twin module (separate file)
+# --- Digital Twin as separate module ---
 import digital_twin
 
 # ======================= Page & Theme =======================
@@ -90,14 +88,19 @@ with st.sidebar:
     st.divider()
     guardrails_on = st.toggle(
         "Guardrails", True,
-        help="ON: stable windows (binder 60–110%, speed ≈1.2–3.5 mm/s, layer ≈3–5×D50). OFF: wider exploration."
+        help="ON: use stable windows. We further tighten them locally for safety."
+    )
+    # NEW: optional extra squeeze (default ON)
+    extra_tight = st.toggle(
+        "Extra-tight window", True,
+        help="Narrows guardrails around the center of the base window (no change to shared.py)."
     )
     target_green = st.slider("Target green %TD", 80, 98, 90, 1)
-    st.caption("Recommendations prefer q10 ≥ target for conservatism.")
+    st.caption("Recommendations favor q10 ≥ target for conservatism.")
 
 # ======================= Header =======================
 st.title("BJAM — Binder-Jet AM Parameter Recommender")
-st.caption("Physics-guided + few-shot • Custom materials supported • Guardrails toggle")
+st.caption("Physics-guided + few-shot • Custom materials supported • Guardrails tightened locally")
 
 with st.expander("Preview source data", expanded=False):
     if len(df_base): st.dataframe(df_base.head(25), use_container_width=True)
@@ -136,8 +139,29 @@ with left:
     d50_um = st.number_input("D50 (µm)", 1.0, 150.0, float(d50_default), 1.0,
                              help="Layer guidance typically ≈ 3–5×D50.")
     pri = physics_priors(d50_um, binder_type_guess=None)
-    gr = guardrail_ranges(d50_um, on=guardrails_on)
-    t_lo, t_hi = gr["layer_thickness_um"]
+
+    # Base windows from shared.py
+    gr_base = guardrail_ranges(d50_um, on=guardrails_on)
+
+    # -------- Tighten guardrails LOCALLY (no change to shared.py) --------
+    def _tighten(lo, hi, shrink=0.65):
+        """Shrink the span around the midpoint. shrink=0.65 keeps 65% of the base range."""
+        lo, hi = float(lo), float(hi)
+        mid = 0.5*(lo+hi)
+        half = 0.5*(hi-lo)*shrink
+        return max(lo, mid-half), min(hi, mid+half)
+
+    if guardrails_on and extra_tight:
+        b_lo_t, b_hi_t = _tighten(*gr_base["binder_saturation_pct"], shrink=0.60)   # keep 60% of base range
+        s_lo_t, s_hi_t = _tighten(*gr_base["roller_speed_mm_s"],     shrink=0.60)
+        # layer control remains from slider; show hint
+        st.caption(f"Tight window: binder {b_lo_t:.0f}–{b_hi_t:.0f}% · speed {s_lo_t:.2f}–{s_hi_t:.2f} mm/s")
+    else:
+        b_lo_t, b_hi_t = [float(x) for x in gr_base["binder_saturation_pct"]]
+        s_lo_t, s_hi_t = [float(x) for x in gr_base["roller_speed_mm_s"]]
+
+    # Layer slider stays as before (using shared.py guidance for bounds)
+    t_lo, t_hi = gr_base["layer_thickness_um"]
     layer_um = st.slider("Layer thickness (µm)", float(round(t_lo)), float(round(t_hi)),
                          float(round(pri["layer_thickness_um"])), 1.0)
 
@@ -176,17 +200,28 @@ st.divider()
 
 # ======================= Recommendations =======================
 st.subheader("Recommended parameters")
-
 colL, colR = st.columns([1, 1])
 top_k = colL.slider("How many to show", 3, 8, 5, 1)
 run_recs = colR.button("Recommend", type="primary", use_container_width=True)
+
+def _within_tight(b, v):
+    return (b_lo_t <= float(b) <= b_hi_t) and (s_lo_t <= float(v) <= s_hi_t)
 
 if run_recs:
     recs = copilot(
         material=material, d50_um=float(d50_um), df_source=df_base, models=models,
         guardrails_on=guardrails_on, target_green=float(target_green), top_k=int(top_k)
     )
-    # Display table (unchanged)
+    # Filter to tight window if enabled; back-fill if fewer than top_k remain
+    if guardrails_on and extra_tight and not recs.empty:
+        tight_mask = recs.apply(lambda r: _within_tight(r["binder_%"], r["speed_mm_s"]), axis=1)
+        recs_tight = recs[tight_mask].copy()
+        if len(recs_tight) < int(top_k):
+            backfill = recs[~tight_mask].head(int(top_k)-len(recs_tight))
+            recs = pd.concat([recs_tight, backfill], ignore_index=True)
+        else:
+            recs = recs_tight
+
     pretty = recs.rename(columns={
         "binder_type": "Binder",
         "binder_%": "Binder sat (%)",
@@ -217,7 +252,7 @@ if run_recs:
         use_container_width=True,
     )
 
-    # NEW: Save compact Top-k for Digital Twin
+    # Save compact Top-k for Digital Twin
     dt = recs.rename(columns={
         "binder_%": "saturation_pct",
         "speed_mm_s": "roller_speed",
@@ -239,7 +274,7 @@ tabs = st.tabs([
     "Packing (2D slice)",
     "Pareto frontier",
     "Formulae",
-    "Digital Twin",  # NEW
+    "Digital Twin",
 ])
 
 def _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family, nx=55, ny=45):
@@ -251,36 +286,72 @@ def _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_clas
     grid["binder_type_rec"] = binder_family
     return grid, sats, spds
 
-# ---- Heatmap
+# ---- Heatmap (tightened window + overlays)
 with tabs[0]:
-    st.subheader("Heatmap — Predicted green %TD")
-    gr_local = guardrail_ranges(d50_um, on=guardrails_on)
-    b_lo,b_hi = gr_local["binder_saturation_pct"]; s_lo,s_hi = gr_local["roller_speed_mm_s"]
-    grid, Xs, Ys = _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family)
+    st.subheader("Heatmap — Predicted green %TD (tight guardrails)")
+
+    # Use the TIGHT window when guardrails_on
+    b_lo, b_hi = (b_lo_t, b_hi_t) if guardrails_on else gr_base["binder_saturation_pct"]
+    s_lo, s_hi = (s_lo_t, s_hi_t) if guardrails_on else gr_base["roller_speed_mm_s"]
+
+    grid, Xs, Ys = _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family, nx=80, ny=60)
     scored = predict_quantiles(models, grid)
     Z = scored.sort_values(["binder_saturation_pct","roller_speed_mm_s"])["td_q50"].to_numpy().reshape(len(Xs), len(Ys)).T
 
+    zmin, zmax = float(np.nanmin(Z)), float(np.nanmax(Z))
+    z0, z1 = max(40.0, zmin), min(100.0, zmax if zmax > zmin else zmin+1.0)
+
     fig = go.Figure()
-    fig.add_trace(go.Heatmap(x=list(Xs), y=list(Ys), z=Z, colorscale="Viridis", colorbar=dict(title="%TD")))
-    fig.add_trace(go.Contour(x=list(Xs), y=list(Ys), z=Z,
-                             contours=dict(start=90, end=90, size=1, coloring="none"),
-                             line=dict(width=3), showscale=False, name="90% TD"))
+    fig.add_trace(go.Heatmap(
+        x=list(Xs), y=list(Ys), z=Z,
+        zmin=z0, zmax=z1, colorscale="Viridis",
+        zsmooth="best",
+        colorbar=dict(title="%TD (q50)", len=0.85)
+    ))
+    # 90% & 95% contours
+    for thr, col in [(90, "#C21807"), (95, "#0c7c59")]:
+        fig.add_trace(go.Contour(
+            x=list(Xs), y=list(Ys), z=Z,
+            contours=dict(start=thr, end=thr, size=1, coloring="none"),
+            line=dict(color=col, width=3, dash="dash"),
+            showscale=False, name=f"{thr}% TD"
+        ))
+
+    # Prior marker
+    fig.add_trace(go.Scatter(
+        x=[pri["binder_saturation_pct"]], y=[pri["roller_speed_mm_s"]],
+        mode="markers+text",
+        marker=dict(size=11, symbol="x", color="#111827"),
+        text=["prior"], textposition="top center",
+        name="Prior"
+    ))
+
+    # “Focus box” around the center of the tight window
+    xb0, xb1 = np.percentile(Xs, [35, 65]); yb0, yb1 = np.percentile(Ys, [35, 65])
+    fig.update_layout(shapes=[
+        dict(type="rect", x0=xb0, x1=xb1, y0=yb0, y1=yb1,
+             line=dict(color="#2bb7b3", width=3, dash="dash"), fillcolor="rgba(0,0,0,0)")
+    ])
+
     fig.update_layout(
         xaxis_title="Binder saturation (%)",
         yaxis_title="Roller speed (mm/s)",
         height=520, margin=dict(l=10, r=10, t=40, b=10),
-        title=f"Layer={layer_um:.0f} µm · D50={d50_um:.0f} µm · Material={material} ({material_class}) · Source={Path(src).name if src else '—'}",
+        title=f"Layer={layer_um:.0f} µm · D50={d50_um:.0f} µm · Material={material} ({material_class}) · Window: {float(b_lo):.0f}–{float(b_hi):.0f}% / {float(s_lo):.2f}–{float(s_hi):.2f} mm/s",
+        legend=dict(orientation="h", y=1.02, x=1.0, xanchor="right")
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# ---- Sensitivity
+# ---- Sensitivity (uses tight window mid-speed)
 with tabs[1]:
-    st.subheader("Saturation sensitivity (q10–q90)")
-    gr_local = guardrail_ranges(d50_um, on=guardrails_on)
-    sats = np.linspace(float(gr_local["binder_saturation_pct"][0]), float(gr_local["binder_saturation_pct"][1]), 61)
+    st.subheader("Saturation sensitivity (q10–q90) in tight window")
+    v_mid = 0.5*(float(s_lo_t)+float(s_hi_t)) if (guardrails_on and extra_tight) else 1.6
+    sats = np.linspace(float(b_lo_t if (guardrails_on and extra_tight) else gr_base["binder_saturation_pct"][0]),
+                       float(b_hi_t if (guardrails_on and extra_tight) else gr_base["binder_saturation_pct"][1]),
+                       75)
     curve_df = pd.DataFrame({
         "binder_saturation_pct": sats,
-        "roller_speed_mm_s": 1.6,
+        "roller_speed_mm_s": np.full_like(sats, v_mid),
         "layer_thickness_um": float(layer_um),
         "d50_um": float(d50_um),
         "material": material,
@@ -297,7 +368,7 @@ with tabs[1]:
     ax2.grid(True, axis="y", alpha=0.18); ax2.legend(frameon=False)
     st.pyplot(fig2, clear_figure=True)
 
-# ---- Packing (2D slice, fast RSA – no external deps)
+# ---- Packing (unchanged from your working version)
 with tabs[2]:
     st.subheader("Packing — 2D slice")
     st.caption("Square slice sized in ×D50. Toggle densification; preview a printed layer with binder fill.")
@@ -309,7 +380,7 @@ with tabs[2]:
     seed     = c4.number_input("Seed", 0, 9999, 0, 1)
 
     W_mult = int(side_mult)
-    base_ref, dense_ref = 260, 520     # particle refs at 20×D50
+    base_ref, dense_ref = 260, 520
     baseline_particles   = int(base_ref  * (W_mult/20)**2)
     densified_particles  = int(dense_ref * (W_mult/20)**2)
     Npx = int(21 * W_mult)
@@ -329,14 +400,12 @@ with tabs[2]:
 
         pts = []
         MAX_ATTEMPTS = 40000; attempts = 0
-
         def can_place(x,y,r):
             if x-r<0 or x+r>W or y-r<0 or y+r>W: return False
             for (px,py,pr) in pts:
                 dx = x - px; dy = y - py
                 if dx*dx + dy*dy < (r+pr)**2: return False
             return True
-
         for r in radii:
             tries = 240 if not densify else 280
             for _ in range(tries):
@@ -402,14 +471,13 @@ with tabs[2]:
         st.pyplot(figL, clear_figure=True)
         st.caption(f"Printed layer • binder≈{binder_sat_pct}% • t/D50={t_over_D50:.2f}")
 
-# ---- Pareto
+# ---- Pareto (computed in the tight window)
 with tabs[3]:
-    st.subheader("Pareto frontier — Binder vs green %TD (fixed layer & D50)")
-    gr_local = guardrail_ranges(d50_um, on=guardrails_on)
-    b_lo,b_hi = gr_local["binder_saturation_pct"]; s_lo,s_hi = gr_local["roller_speed_mm_s"]
+    st.subheader("Pareto frontier — Binder vs green %TD (tight window)")
+    b_lo, b_hi = (b_lo_t, b_hi_t) if guardrails_on else gr_base["binder_saturation_pct"]
     grid_p = pd.DataFrame({
         "binder_saturation_pct": np.linspace(float(b_lo), float(b_hi), 80),
-        "roller_speed_mm_s": np.full(80, 1.6),
+        "roller_speed_mm_s": np.full(80, 0.5*(float(s_lo_t)+float(s_hi_t)) if (guardrails_on and extra_tight) else 1.6),
         "layer_thickness_um": np.full(80, float(layer_um)),
         "d50_um": np.full(80, float(d50_um)),
         "material": [material]*80,
@@ -441,13 +509,13 @@ with tabs[4]:
     st.latex(r"\phi = \frac{V_{\text{solids}}}{V_{\text{total}}}")
     st.caption("Few-shot model refines these physics-guided priors using your dataset.")
 
-# ---- Digital Twin (NEW)
+# ---- Digital Twin
 with tabs[5]:
     digital_twin.render(material=material, d50_um=float(d50_um), layer_um=float(layer_um))
 
 # ======================= Diagnostics & Footer =======================
 with st.expander("Diagnostics", expanded=False):
-    st.write("Guardrails on:", guardrails_on)
+    st.write("Guardrails on:", guardrails_on, "| Extra-tight:", extra_tight)
     st.write("Source file:", src or "—")
     st.write("Models meta:", meta if meta else {"note": "No trained models (physics-only)."})
 
