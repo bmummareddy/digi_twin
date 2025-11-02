@@ -28,8 +28,8 @@ import digital_twin
 
 # ---------------- UI shell ----------------
 st.set_page_config(page_title="BJAM Predictions", layout="wide", initial_sidebar_state="expanded")
-st.title("BJAM — Binder-Jet AM Parameter Recommender")
-st.caption("Physics-guided + few-shot • Digital Twin • Guardrails hardened for out-of-range inputs")
+st.title("Physics guided Binder Jet AM Studio")
+st.caption("Physics-guided • stl aware • Practical UX •Predicts process parameters based on powder particle size and type of binder")
 
 # ---------------- Data & models ----------------
 df_base, src = load_dataset(".")
@@ -224,7 +224,7 @@ tabs = st.tabs([
     "Packing (2D slice)",
     "Pareto frontier",
     "Formulae",
-    "Digital Twin",
+    "stl UX for particle distribution",
 ])
 
 def _grid_for_context(b_lo,b_hi,v_lo,v_hi,layer_um,d50_um,material,material_class,binder_family, nx=80, ny=60):
