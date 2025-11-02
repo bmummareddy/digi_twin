@@ -483,7 +483,7 @@ from PIL import Image, ImageDraw
 _HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
 _HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
 _HAVE_SCIPY   = importlib.util.find_spec("scipy")   is not None
-if _HAV E_TRIMESH:
+if _HAVE_TRIMESH:
     import trimesh  # type: ignore
 if _HAVE_SHAPELY:
     from shapely.geometry import Polygon, Point, box  # type: ignore
