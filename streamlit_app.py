@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-# BJAM — Binder-Jet AM Parameter Recommender + Digital Twin (surgical add-on)
-# - Keeps existing app structure/UX
-# - Uses your shared.py models as-is (no override)
-# - Digital Twin tab: STL-first, layer-by-layer slices, fast hex-packing, cached
+# BJAM — Binder-Jet AM Parameter Recommender + Digital Twin (hash-safe caches)
 
 from __future__ import annotations
 import io, importlib.util
@@ -17,7 +14,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import streamlit as st
 
-# ---- Project utilities you already have
+# ---- Your project utilities (unchanged behavior)
 from shared import (
     load_dataset,
     train_green_density_models,
@@ -28,12 +25,7 @@ from shared import (
 )
 
 # ======================= Page & Theme =======================
-st.set_page_config(
-    page_title="BJAM Predictions",
-    page_icon="🟨",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="BJAM Predictions", page_icon="🟨", layout="wide")
 
 st.markdown("""
 <style>
@@ -70,7 +62,7 @@ with st.sidebar:
             mime="text/csv",
         )
     else:
-        st.warning("No dataset found. App will use physics priors only (few-shot disabled).")
+        st.warning("No dataset found. App will use physics priors only.")
 
     st.divider()
     guardrails_on = st.toggle(
@@ -78,7 +70,7 @@ with st.sidebar:
         help="ON: stable windows (binder 60–110%, speed ≈1.2–3.5 mm/s, layer ≈3–5×D50). OFF: wider exploration."
     )
     target_green = st.slider("Target green %TD", 80, 98, 90, 1)
-    st.caption("Recommendations prefer q10 ≥ target for conservatism.")
+    st.caption("Recommendations prefer q10 ≥ target (conservative).")
 
 # ======================= Header =======================
 st.title("BJAM — Binder-Jet AM Parameter Recommender")
@@ -121,7 +113,7 @@ with left:
                              help="Layer guidance typically ≈ 3–5×D50.")
     pri = physics_priors(d50_um, binder_type_guess=None)
     gr = guardrail_ranges(d50_um, on=guardrails_on)
-    # Robust slider bounds to avoid Streamlit range errors
+    # robust slider bounds (avoid Streamlit range errors)
     t_lo, t_hi = [float(gr["layer_thickness_um"][0]), float(gr["layer_thickness_um"][1])]
     if not np.isfinite(t_lo) or not np.isfinite(t_hi) or t_lo >= t_hi:
         t_lo, t_hi = max(5.0, 3.0*d50_um), min(300.0, 5.0*d50_um)
@@ -167,38 +159,11 @@ if run_recs:
         material=material, d50_um=float(d50_um), df_source=df_base, models=models,
         guardrails_on=guardrails_on, target_green=float(target_green), top_k=int(top_k)
     )
-    # ensure an 'id' column exists for Digital Twin selection
     if "id" not in recs.columns:
         recs = recs.copy()
         recs["id"] = [f"Opt-{i+1}" for i in range(len(recs))]
     st.session_state["top5_recipes_df"] = recs.copy()
-
-    pretty = recs.rename(columns={
-        "binder_type": "Binder",
-        "binder_%": "Binder sat (%)",
-        "saturation_pct": "Binder sat (%)",  # accommodate both schemas
-        "speed_mm_s": "Speed (mm/s)",
-        "roller_speed": "Speed (mm/s)",
-        "layer_um": "Layer (µm)",
-        "predicted_%TD_q10": "q10 %TD",
-        "predicted_%TD_q50": "q50 %TD",
-        "predicted_%TD_q90": "q90 %TD",
-        "td_q10": "q10 %TD",
-        "td_q50": "q50 %TD",
-        "td_q90": "q90 %TD",
-    })
-    st.dataframe(
-        pretty,
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.download_button(
-        "Download recommendations (CSV)",
-        data=pretty.to_csv(index=False).encode("utf-8"),
-        file_name="bjam_recommendations.csv",
-        type="secondary",
-        use_container_width=True,
-    )
+    st.dataframe(recs, use_container_width=True, hide_index=True)
 else:
     st.info("Click Recommend to generate top-k parameter sets aimed at your target green %TD.")
 
@@ -229,13 +194,11 @@ with tabs[0]:
     gr = guardrail_ranges(d50_um, on=guardrails_on)
     b_lo,b_hi = gr["binder_saturation_pct"]; s_lo,s_hi = gr["roller_speed_mm_s"]
     binder_family = "water_based" if material_class in ("oxide","carbide") else "solvent_based"
-
     grid, Xs, Ys = _grid_for_context(b_lo,b_hi,s_lo,s_hi,layer_um,d50_um,material,material_class,binder_family)
     scored = predict_quantiles(models, grid).copy()
     Z = scored.sort_values(["binder_saturation_pct","roller_speed_mm_s"])["td_q50"].to_numpy().reshape(len(Xs), len(Ys)).T
     fig = go.Figure()
     fig.add_trace(go.Heatmap(x=list(Xs), y=list(Ys), z=Z, colorscale="Viridis", colorbar=dict(title="%TD")))
-    fig.add_hline(y=float((s_lo+s_hi)/2.0), line=dict(color="#444", dash="dot", width=1))
     fig.update_layout(
         xaxis_title="Binder saturation (%)",
         yaxis_title="Roller speed (mm/s)",
@@ -295,53 +258,59 @@ with tabs[3]:
     st.latex(r"\text{Packing fraction:}\quad \phi = \frac{V_{\text{solids}}}{V_{\text{total}}}")
 
 # ==============================================================================
-# TAB 5: Digital Twin (STL-first, per-layer packing; does NOT alter originals)
+# TAB 5: Digital Twin (hash-safe caching; STL-first)
 # ==============================================================================
 with tabs[4]:
     st.subheader("Digital Twin — STL slice + per-layer packing (cached)")
 
-    # lazy import: the rest of the app works even if these are missing
     HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
     HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
     if not (HAVE_TRIMESH and HAVE_SHAPELY):
         st.error("Please add 'trimesh' and 'shapely' to requirements.txt for Digital Twin.")
     else:
         import trimesh as _tm
-        from shapely.geometry import Polygon as _Poly, Point as _Pt, box as _box
+        from shapely.geometry import Polygon as _Poly, box as _box
         from shapely.ops import unary_union as _uun
         from shapely import wkb as _wkb
 
-        # ---- helpers (cached) ------------------------------------------------
+        # ---- hash-safe cached helpers ---------------------------------------
         @st.cache_resource(show_spinner=False)
-        def _load_mesh_from_bytes(stl_bytes: bytes):
+        def _load_mesh_from_bytes(stl_bytes: bytes) -> Tuple[np.ndarray, np.ndarray]:
+            """Return (V, F) arrays for hashable caching downstream."""
             try:
                 m = _tm.load(io.BytesIO(stl_bytes), file_type="stl", force="mesh", process=False)
                 if not isinstance(m, _tm.Trimesh):
                     m = m.dump(concatenate=True)
                 m.rezero()
-                return m
+                return m.vertices.copy(), m.faces.copy()
             except Exception as e:
                 st.error(f"Could not read STL: {e}")
-                return None
+                return np.empty((0,3), float), np.empty((0,3), int)
 
         @st.cache_resource(show_spinner=False)
-        def _decimate_for_plot(mesh: "_tm.Trimesh", max_faces: int = 60_000) -> "_tm.Trimesh":
-            try:
-                if mesh.faces.shape[0] <= max_faces:
-                    return mesh
-                m = mesh.copy()
-                try:
-                    m = m.simplify_quadratic_decimation(max_faces)
-                except Exception:
-                    step = int(np.ceil(mesh.faces.shape[0] / max_faces))
-                    m = _tm.Trimesh(vertices=mesh.vertices.copy(), faces=mesh.faces[::step].copy(), process=False)
-                return m
-            except Exception:
-                return mesh
+        def _cube_vertices_faces(extents=(10.0,10.0,10.0)) -> Tuple[np.ndarray, np.ndarray]:
+            m = _tm.creation.box(extents=extents)
+            return m.vertices.copy(), m.faces.copy()
 
         @st.cache_data(show_spinner=False)
-        def _slice_polys_wkb(mesh_verts, mesh_faces, z: float) -> Tuple[bytes, ...]:
-            m = _tm.Trimesh(vertices=mesh_verts, faces=mesh_faces, process=False)
+        def _decimate_for_plot_arrays(V: np.ndarray, F: np.ndarray, max_faces: int = 60_000) -> Tuple[np.ndarray, np.ndarray]:
+            """Decimate using trimesh, but cache by arrays (hashable) instead of Trimesh object."""
+            try:
+                m = _tm.Trimesh(vertices=V, faces=F, process=False)
+                if F.shape[0] <= max_faces:
+                    return V, F
+                try:
+                    m2 = m.simplify_quadratic_decimation(max_faces)
+                    return m2.vertices.copy(), m2.faces.copy()
+                except Exception:
+                    step = int(np.ceil(F.shape[0] / max_faces))
+                    return V.copy(), F[::max(1,step)].copy()
+            except Exception:
+                return V, F
+
+        @st.cache_data(show_spinner=False)
+        def _slice_polys_wkb(V: np.ndarray, F: np.ndarray, z: float) -> Tuple[bytes, ...]:
+            m = _tm.Trimesh(vertices=V, faces=F, process=False)
             zmin, zmax = float(m.bounds[0][2]), float(m.bounds[1][2])
             span = max(zmax - zmin, 1e-9); eps = 1e-6 * span
             for zi in (z, z+eps, z-eps, z+2*eps, z-2*eps):
@@ -365,7 +334,7 @@ with tabs[4]:
             return tuple()
 
         @st.cache_data(show_spinner=False)
-        def _crop_local(_polys_wkb: Tuple[bytes, ...]):
+        def _crop_to_square_local(_polys_wkb: Tuple[bytes, ...]):
             if not _polys_wkb:
                 return tuple(), (0.0, 0.0), 0.0
             polys = [_wkb.loads(p) for p in _polys_wkb]
@@ -389,10 +358,11 @@ with tabs[4]:
         @st.cache_data(show_spinner=False)
         def _hex_pack(_key, polys_wkb: Tuple[bytes, ...], d50_unit: float, phi_target: float,
                       fov: float, cap: int, jitter: float):
+            from shapely.ops import unary_union as _uun_local
             if not polys_wkb:
                 return np.empty((0,2)), np.empty((0,)), 0.0
             polys = [_wkb.loads(p) for p in polys_wkb]
-            dom = _uun(polys)
+            dom = _uun_local(polys)
             if getattr(dom, "is_empty", True):
                 return np.empty((0,2)), np.empty((0,)), 0.0
             phi = float(np.clip(phi_target, 0.40, 0.88))
@@ -485,59 +455,64 @@ with tabs[4]:
 
             c1, c2 = st.columns([2,1])
             with c1:
-                stl_file = st.file_uploader("Upload STL (required to override cube)", type=["stl"])
+                stl_file = st.file_uploader("Upload STL (overrides cube)", type=["stl"])
             with c2:
                 use_cube = st.checkbox("Use 10 mm cube", value=(stl_file is None), disabled=(stl_file is not None))
 
+            # Hashable mesh pipeline: always work with (V,F) ndarrays
             if stl_file is not None:
-                mesh = _load_mesh_from_bytes(stl_file.read())
+                V, F = _load_mesh_from_bytes(stl_file.read())
             elif use_cube:
-                mesh = _tm.creation.box(extents=(10.0,10.0,10.0))
+                V, F = _cube_vertices_faces((10.0,10.0,10.0))
             else:
-                mesh = None
+                V, F = np.empty((0,3), float), np.empty((0,3), int)
 
-            if mesh is None:
+            if V.size == 0 or F.size == 0:
                 st.warning("Upload an STL or use the 10 mm cube.")
             else:
-                mesh_light = _decimate_for_plot(mesh, max_faces=60_000)
-                V = mesh_light.vertices; F = mesh_light.faces
+                # 3D preview on decimated arrays (hash-safe)
+                Vp, Fp = _decimate_for_plot_arrays(V, F, max_faces=60_000)
                 figm = go.Figure(data=[go.Mesh3d(
-                    x=V[:,0].tolist(), y=V[:,1].tolist(), z=V[:,2].tolist(),
-                    i=F[:,0].tolist(), j=F[:,1].tolist(), k=F[:,2].tolist(),
+                    x=Vp[:,0].tolist(), y=Vp[:,1].tolist(), z=Vp[:,2].tolist(),
+                    i=Fp[:,0].tolist(), j=Fp[:,1].tolist(), k=Fp[:,2].tolist(),
                     color="lightgray", opacity=0.58, flatshading=True
                 )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=0,b=0), height=340)
                 st.plotly_chart(figm, use_container_width=True)
 
-                minz, maxz = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
+                # Layering (use original V,F for accurate bounds)
+                m_bounds = _tm.Trimesh(vertices=V, faces=F, process=False).bounds
+                minz, maxz = float(m_bounds[0,2]), float(m_bounds[1,2])
                 thickness = layer_r * um2unit
                 n_layers = max(1, int((maxz - minz) / max(thickness, 1e-12)))
-                st.markdown(f"**Layers:** {n_layers}   |   Z span: {maxz - minz:.5f} {units}")
+                st.markdown(f"**Layers:** {n_layers}   |   Z span: {maxz - minz:.6f} {units}")
                 layer_idx = st.slider("Layer index", 1, n_layers, 1)
                 z = minz + (layer_idx - 0.5) * thickness
 
-                polys = _slice_polys_wkb(mesh.vertices, mesh.faces, z)
+                # Slice → crop square local → hex-pack → raster
+                polys = _slice_polys_wkb(V, F, z)
                 if not polys:
                     st.warning("Empty slice at this layer. Try neighboring layers or check units.")
                 else:
-                    local_wkb, origin, fov = _crop_local(polys)
+                    local_wkb, origin, fov = _crop_to_square_local(polys)
                     d50_unit = d50_r * um2unit
-                    phi_target = float(np.clip(0.90*0.90, 0.40, 0.88))  # aim φ2D~0.81 for 90% TPD goal
+                    phi_target = float(np.clip(0.90*0.90, 0.40, 0.88))  # aim φ2D~0.81
 
                     centers, radii, phi2D = _hex_pack(
                         (hash(local_wkb), round(d50_unit,9), round(fov,6), cap, layer_idx),
                         local_wkb, d50_unit, phi_target, fov, cap, jitter=0.12
                     )
-
                     solids = _raster_solids((hash(centers.tobytes()) if centers.size else 0, px, round(fov,6)),
                                             centers, radii, fov, px)
                     pores = ~solids
                     sat = float(np.clip(sat_pct/100.0, 0.01, 0.99))
                     voids = _voids_from_sat((hash(pores.tobytes()), round(sat,4), layer_idx), pores, sat, 123+layer_idx)
 
-                    # image panels for speed
+                    # Fast image panels
                     def _hex_to_rgb(h): return tuple(int(h[i:i+2],16)/255.0 for i in (1,3,5))
                     img1 = np.ones((px,px,3), float); img1[solids] = np.array([0.18, 0.38, 0.96])
-                    img2 = np.ones((px,px,3), float); img2[:] = _hex_to_rgb(_binder_hex(binder))
+                    img2 = np.ones((px,px,3), float); img2[:] = _hex_to_rgb(
+                        "#F2D06F" if "water" in binder.lower() else "#F2B233"
+                    )
                     img2[voids] = np.array([1.0, 1.0, 1.0]); img2[solids] = np.array([0.18, 0.38, 0.96])
 
                     colA, colB = st.columns(2)
@@ -552,7 +527,7 @@ with tabs[4]:
                         figB.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=False), height=420)
                         st.plotly_chart(figB, use_container_width=True)
 
-                    st.caption(f"Layer {layer_idx}/{n_layers} · FOV={fov:.5f} {units} · φ₂D≈{phi2D:.2f} · particles={radii.size} · D50={d50_unit:.5g} {units}")
+                    st.caption(f"Layer {layer_idx}/{n_layers} · FOV={fov:.6f} {units} · φ₂D≈{phi2D:.2f} · particles={radii.size} · D50={d50_unit:.5g} {units}")
 
 # ==============================================================================
 # TAB 6: Data health
@@ -602,4 +577,4 @@ with tabs[5]:
 with st.expander("Diagnostics", expanded=False):
     st.write("Guardrails on:", guardrails_on)
     st.write("Source file:", src or "—")
-    st.write("Models meta:", meta if meta else {"note": "No trained models (physics-only)."})
+    st.write("Models meta:", meta if meta else {"note": "No trained models."})
