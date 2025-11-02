@@ -233,7 +233,7 @@ def _pack(polys_wkb_list: List[bytes], diam_units: np.ndarray, phi_target: float
     return centers, radii, float(phi)
 
 # ----------------------------- Plot helpers -----------------------------------
-def _scale_bar(ax, fov_mm: float, length_um: int = 500):
+def _scale_bar(ax, fov_mm: float, length_um: int = 100):
     length_mm = length_um / 1000.0
     if length_mm >= fov_mm:
         return
