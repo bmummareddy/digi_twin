@@ -19,7 +19,7 @@ from shared import load_dataset, train_green_density_models, predict_quantiles, 
 
 # ------------------------------- Page config & style --------------------------
 st.set_page_config(page_title="BJAM Predictions", page_icon="🟨", layout="wide")
-BUILD = "2025-11-01 — Original flow + Digital Twin (Beta)"
+BUILD = "2025-11-01 — Original flow + Digital Twin (Beta) — layer_thickness_um fix"
 st.caption(f"Build: {BUILD}")
 st.markdown("""
 <style>
@@ -31,7 +31,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Quick cache reset button (handy on Streamlit Cloud)
+# Quick cache reset button
 with st.sidebar:
     if st.button("Clear cached data & restart", use_container_width=True):
         try: st.cache_data.clear()
@@ -207,7 +207,7 @@ def pack_in_domain(polys, diam_units, phi2D_target, max_particles, max_trials, s
 
 # ------------------------------- Data & models --------------------------------
 df_base, src_path = load_dataset(".")
-models, meta = train_green_density_models(df_base)  # cached & robust
+models, meta = train_green_density_models(df_base)  # your shared.py can accept df
 
 # ------------------------------- Sidebar --------------------------------------
 with st.sidebar:
@@ -234,9 +234,10 @@ def recommend_balanced_top5(material, d50_um, layer_um, target_green, guardrails
     def candidates(binder_type):
         Xs = np.linspace(sat_lo, sat_hi, 36)
         Ys = np.linspace(spd_lo, spd_hi, 28)
-        g = pd.DataFrame([(b, v, d50_um) for v in Ys for b in Xs],
-                         columns=["binder_saturation_pct","roller_speed_mm_s","d50_um"])
-        g["material"] = material
+        # IMPORTANT: include layer_thickness_um since shared.predict_quantiles expects it
+        g = pd.DataFrame([(b, v, float(layer_um), float(d50_um), material)
+                          for v in Ys for b in Xs],
+                         columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
         pr = predict_quantiles(models, g)
         g = g.join(pr[["td_q10","td_q50","td_q90"]])
         g["binder_type_rec"] = binder_type
@@ -284,7 +285,7 @@ with tab_pred:
     st.dataframe(recs, use_container_width=True, hide_index=True)
 
 # ==============================================================================
-# Heatmap (q50 with smoothing)
+# Heatmap (q50 with smoothing) — include layer_thickness_um
 # ==============================================================================
 with tab_heat:
     st.subheader("Predicted Green %TD (q50) — speed × saturation")
@@ -293,13 +294,13 @@ with tab_heat:
     Xs = np.linspace(float(sat_lo), float(sat_hi), 85)
     Ys = np.linspace(float(spd_lo), float(spd_hi), 70)
 
-    grid = pd.DataFrame([(b, v, d50_um) for v in Ys for b in Xs], columns=["binder_saturation_pct","roller_speed_mm_s","d50_um"])
-    grid["material"] = material
+    grid = pd.DataFrame([(b, v, float(layer_um), float(d50_um), material)
+                         for v in Ys for b in Xs],
+                        columns=["binder_saturation_pct","roller_speed_mm_s","layer_thickness_um","d50_um","material"])
     pr = predict_quantiles(models, grid)
     dfZ = pd.DataFrame({"sat": pr["binder_saturation_pct"], "spd": pr["roller_speed_mm_s"], "z": pr["td_q50"]}).astype(float)
     Z = dfZ.pivot_table(index="spd", columns="sat", values="z").sort_index().sort_index(axis=1)
 
-    # Optional smoothing
     sigma = st.slider("Smoothing σ", 0.0, 2.0, 1.0, 0.1, help="Set to 0 for raw model output.")
     Zv = Z.values.copy()
     if sigma > 0: Zv = gaussian_filter(Zv, sigma=sigma, mode="nearest")
@@ -321,7 +322,7 @@ with tab_heat:
     st.plotly_chart(fig, use_container_width=True)
 
 # ==============================================================================
-# Saturation sensitivity (q10–q90 band + q50)
+# Saturation sensitivity — include layer_thickness_um
 # ==============================================================================
 with tab_sens:
     st.subheader("Saturation sensitivity at representative speed")
@@ -331,7 +332,8 @@ with tab_sens:
     grid = pd.DataFrame({
         "binder_saturation_pct": sat_axis,
         "roller_speed_mm_s": np.full_like(sat_axis, v_mid),
-        "d50_um": np.full_like(sat_axis, d50_um),
+        "layer_thickness_um": np.full_like(sat_axis, float(layer_um)),
+        "d50_um": np.full_like(sat_axis, float(d50_um)),
         "material": [material]*len(sat_axis),
     })
     pred = predict_quantiles(models, grid)
@@ -400,18 +402,14 @@ with tab_twin:
     if not (HAVE_TRIMESH and HAVE_SHAPELY):
         st.error("Digital Twin needs 'trimesh' and 'shapely' (see requirements.txt).")
     else:
-        # Use Top-5 from Predict tab
         top5 = st.session_state.get("top5_recipes_df")
         if top5 is None or getattr(top5, "empty", True):
             st.info("Run the Predict tab first to generate Top-5 recipes.")
         else:
             top5 = top5.reset_index(drop=True).copy()
-
-            # Perf & viewing controls
             cfast, cmesh = st.columns([1,1])
             with cfast:
-                fast_mode = st.toggle("Fast mode (recommended)", value=True,
-                                      help="Reduces particle count/resolution for smoother interaction.")
+                fast_mode = st.toggle("Fast mode (recommended)", value=True)
             with cmesh:
                 show_mesh = st.toggle("Show 3D mesh preview", value=not fast_mode)
 
@@ -427,17 +425,13 @@ with tab_twin:
             with c2: pack_full = st.checkbox("Pack full slice (auto FOV)", value=True)
             with c3: cap = st.slider("Visual cap (particles)", 200, 4000, 1200 if fast_mode else 2200, 50)
 
-            # Chosen recipe
             rec = top5[top5["id"]==rec_id].iloc[0]
             d50_r   = float(rec.get("d50_um",  d50_um))
             layer_r = float(rec.get("layer_um", layer_um))
             sat_pct = float(rec.get("saturation_pct", 85.0))
             binder  = str(rec.get("binder_type","water_based"))
 
-            # Target 2D packing ~ fraction of green target (qualitative)
             phi2D_target = float(np.clip(0.90 * (sat_pct/100.0 + 0.05), 0.40, 0.88))
-
-            # Particle sizes
             diam_um   = sample_psd_um(9000 if not fast_mode else 5000, d50_r, None, None, seed=9991)
             diam_unit = diam_um * um2unit
 
@@ -466,13 +460,11 @@ with tab_twin:
                         color="lightgray", opacity=0.55, flatshading=True, name="Part"
                     )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=0,b=0), height=360)
                     st.plotly_chart(figm, use_container_width=True)
-                # Slice polygons
                 polys_world = slice_polys(mesh, z)
             else:
                 polys_world = []
                 n_layers, layer_idx, z = 1, 1, 0.0
 
-            # Determine local window/FOV
             if pack_full and polys_world:
                 dom = unary_union(polys_world)
                 xmin, ymin, xmax, ymax = dom.bounds
@@ -494,13 +486,11 @@ with tab_twin:
                     half=fov_mm/2.0; polys_local=[box(0,0,2*half,2*half)]
                 render_fov = float(fov_mm)
 
-            # Pack circles
             centers, radii, phi2D = pack_in_domain(polys_local, diam_unit, phi2D_target,
                                                    max_particles=int(cap),
                                                    max_trials=300_000 if fast_mode else 480_000,
                                                    seed=20_000 + (0 if mesh is None else layer_idx))
 
-            # Render two panels
             col1, col2 = st.columns(2)
             with col1:
                 figA, axA = plt.subplots(figsize=(5.2,5.2), dpi=170 if fast_mode else 188)
