@@ -72,7 +72,7 @@ Open: https://bjampredictions.streamlit.app/
 ### B) Run locally
 ```bash
 # 1) Clone
-git clone https://github.com/<your-username>/BJAM.git
+git clone https://github.com/bmummareddy/BJAM.git
 cd BJAM
 
 # 2) (Recommended) Python 3.11 virtual env
