@@ -1,309 +1,397 @@
-# digital_twin.py — STL slice → qualitative packing (import-safe: no Streamlit cache at import time)
+# -*- coding: utf-8 -*-
+# digital_twin.py
+# Digital Twin module for BJAM - STL slicing, particle packing, and visualization
+# Separate module to keep main app clean and modular
+
 from __future__ import annotations
-import io, math, importlib.util
-from typing import List, Tuple, Dict
+import io, math
+from typing import List, Tuple, Dict, Optional
+
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
+import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from PIL import Image, ImageDraw
 
-# Import Streamlit only so we can render inside render(); do not call st.* at import time.
-import streamlit as st
+# Conditional imports for geometry
+try:
+    import trimesh
+    HAVE_TRIMESH = True
+except ImportError:
+    HAVE_TRIMESH = False
 
-# Optional deps (resolved lazily)
-_HAVE_TRIMESH = importlib.util.find_spec("trimesh") is not None
-_HAVE_SHAPELY = importlib.util.find_spec("shapely") is not None
-_HAVE_SCIPY   = importlib.util.find_spec("scipy")   is not None
-if _HAVE_TRIMESH:
-    import trimesh  # type: ignore
-if _HAVE_SHAPELY:
-    from shapely.geometry import Polygon, Point, box  # type: ignore
-    from shapely.ops import unary_union  # type: ignore
-if _HAVE_SCIPY:
-    from scipy import ndimage as ndi  # type: ignore
+try:
+    from shapely.geometry import Polygon, Point, box
+    from shapely.ops import unary_union
+    from shapely import wkb
+    HAVE_SHAPELY = True
+except ImportError:
+    HAVE_SHAPELY = False
 
-# Colors
-_COLOR_PARTICLE = "#2F6CF6"
-_COLOR_EDGE     = "#1f2937"
-_COLOR_BORDER   = "#111111"
-_COLOR_VOID     = "#FFFFFF"
-_COLOR_BINDERS  = {"water":"#F2D06F","solvent":"#F2B233","other":"#F4B942"}
+try:
+    from scipy import ndimage as ndi
+    HAVE_SCIPY = True
+except ImportError:
+    HAVE_SCIPY = False
 
-def _binder_hex(name:str)->str:
-    k=(name or "").lower()
-    if "water" in k: return _COLOR_BINDERS["water"]
-    if "solvent" in k: return _COLOR_BINDERS["solvent"]
-    return _COLOR_BINDERS["other"]
+# ------------------------------- Colors & Constants ---------------------------
+BINDER_COLORS = {
+    "water_based": "#F2D06F",
+    "solvent_based": "#F2B233",
+    "furan": "#F5C07A",
+    "acrylic": "#FFD166",
+    "other": "#F4B942"
+}
+PARTICLE = "#2F6CF6"
+EDGE = "#1f2937"
+BORDER = "#111111"
+VOID = "#FFFFFF"
 
-# ---------- Pure helpers (no st.* here) ----------
-def _load_mesh_from_bytes(data: bytes):
-    if not _HAVE_TRIMESH:
-        raise RuntimeError("trimesh not installed")
-    m = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh", process=False)
-    if not isinstance(m, trimesh.Trimesh):
-        m = m.dump(concatenate=True)
-    return m
+def binder_color(name: str) -> str:
+    """Get binder color from name"""
+    key = (name or "").lower()
+    for k, v in BINDER_COLORS.items():
+        if k in key:
+            return v
+    return BINDER_COLORS["other"]
 
-def _slice_polys(mesh, z)->List["Polygon"]:
-    if not _HAVE_SHAPELY: return []
+# ------------------------------- PSD Sampling ---------------------------------
+@st.cache_data(show_spinner=False)
+def sample_psd_um(n: int, d50_um: float, d10_um: Optional[float], 
+                  d90_um: Optional[float], seed: int) -> np.ndarray:
+    """Generate particle size distribution using lognormal"""
+    rng = np.random.default_rng(seed)
+    med = max(1e-9, float(d50_um))
+    if d10_um and d90_um and d90_um > d10_um > 0:
+        m = np.log(med)
+        s = (np.log(d90_um) - np.log(d10_um)) / (2*1.2815515655446004)
+        s = float(max(s, 0.05))
+    else:
+        m, s = np.log(med), 0.25
+    d = np.exp(rng.normal(m, s, size=n))
+    return np.clip(d, 0.30*med, 3.00*med)
+
+# ------------------------------- Mesh Loading ---------------------------------
+@st.cache_resource(show_spinner="Loading mesh...")
+def load_mesh_from_bytes(file_bytes: bytes):
+    """Load and cache mesh from STL bytes"""
+    if not HAVE_TRIMESH:
+        raise ImportError("trimesh required for STL loading")
     try:
-        sec = mesh.section(plane_origin=(0,0,z), plane_normal=(0,0,1))
-        if sec is None: return []
-        planar,_ = sec.to_planar()
-        out = [Polygon(p) for p in getattr(planar, "polygons_full", [])]
-        return [p.buffer(0) for p in out if p.is_valid and p.area>1e-8]
+        mesh = trimesh.load(io.BytesIO(file_bytes), file_type="stl", force="mesh", process=False)
+        if not isinstance(mesh, trimesh.Trimesh):
+            mesh = mesh.dump(concatenate=True)
+        return mesh
+    except Exception as e:
+        st.error(f"Could not read STL: {e}")
+        return None
+
+@st.cache_resource(show_spinner="Creating cube...")
+def get_cube_mesh():
+    """Get built-in 10mm cube mesh"""
+    if not HAVE_TRIMESH:
+        raise ImportError("trimesh required for cube generation")
+    return trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+
+# ------------------------------- Mesh Slicing ---------------------------------
+@st.cache_data(show_spinner=False)
+def slice_mesh_at_z(_mesh_hash, mesh_verts, mesh_faces, z) -> List[bytes]:
+    """
+    Slice mesh at Z height and return WKB polygons.
+    Cached per mesh + Z position.
+    """
+    if not HAVE_TRIMESH or not HAVE_SHAPELY:
+        raise ImportError("trimesh and shapely required for slicing")
+    
+    try:
+        mesh = trimesh.Trimesh(vertices=mesh_verts, faces=mesh_faces)
+        
+        # Try slicing with small tolerance offsets if exact fails
+        sect = mesh.section(plane_origin=(0, 0, z), plane_normal=(0, 0, 1))
+        if sect is None:
+            for offset in [0.0001, -0.0001, 0.001, -0.001]:
+                sect = mesh.section(plane_origin=(0, 0, z+offset), plane_normal=(0, 0, 1))
+                if sect is not None:
+                    break
+        
+        if sect is None:
+            return []
+        
+        # Convert to 2D polygons
+        planar, _ = sect.to_planar()
+        polys = [Polygon(p) for p in getattr(planar, "polygons_full", [])]
+        valid = [p.buffer(0) for p in polys if p.is_valid and p.area > 1e-8]
+        return [p.wkb for p in valid]
     except Exception:
         return []
 
-def _crop_to_fov(polys, fov):
-    if not polys: return [], (0.0, 0.0)
-    dom = unary_union(polys); cx,cy = dom.centroid.x, dom.centroid.y
-    half=fov/2.0; xmin, ymin = cx-half, cy-half
-    win = box(xmin, ymin, xmin+fov, ymin+fov)
+# ------------------------------- FOV Cropping ---------------------------------
+@st.cache_data(show_spinner=False)
+def crop_to_fov(_polys_wkb_tuple, fov_size):
+    """Crop polygons to field of view"""
+    if not HAVE_SHAPELY:
+        raise ImportError("shapely required for FOV cropping")
+    
+    if not _polys_wkb_tuple:
+        return [], (0.0, 0.0)
+    
+    polys = [wkb.loads(p) for p in _polys_wkb_tuple]
+    dom = unary_union(polys)
+    cx, cy = dom.centroid.x, dom.centroid.y
+    half = fov_size / 2.0
+    xmin, ymin = cx - half, cy - half
+    win = box(xmin, ymin, xmin + fov_size, ymin + fov_size)
     res = dom.intersection(win)
-    if getattr(res,"is_empty",True): return [], (xmin, ymin)
+    
+    if getattr(res, "is_empty", True):
+        return [], (xmin, ymin)
+    
     geoms = [res] if isinstance(res, Polygon) else [g for g in res.geoms if isinstance(g, Polygon)]
-    return geoms, (xmin, ymin)
+    return [g.wkb for g in geoms], (xmin, ymin)
 
-def _to_local(polys, origin_xy):
-    if not polys: return []
+@st.cache_data(show_spinner=False)
+def to_local_coords(_polys_wkb_tuple, origin_xy):
+    """Convert polygons to local coordinate system"""
+    if not HAVE_SHAPELY:
+        raise ImportError("shapely required for coordinate conversion")
+    
+    if not _polys_wkb_tuple:
+        return []
+    
     ox, oy = origin_xy
-    out=[]
+    polys = [wkb.loads(p) for p in _polys_wkb_tuple]
+    out = []
     for p in polys:
-        x,y = p.exterior.xy
-        out.append(Polygon(np.c_[np.array(x)-ox, np.array(y)-oy]))
+        x, y = p.exterior.xy
+        out.append(Polygon(np.c_[np.array(x) - ox, np.array(y) - oy]).wkb)
     return out
 
-def _psd_um(n:int, d50_um:float, seed:int)->np.ndarray:
-    rng = np.random.default_rng(seed)
-    mu, sigma = np.log(max(d50_um,1e-6)), 0.25
-    d = np.exp(rng.normal(mu, sigma, size=n))
-    return np.clip(d, 0.3*d50_um, 3.0*d50_um)
-
-def _pack(polys, diam_units, phi_target, max_particles, max_trials, seed):
-    if not _HAVE_SHAPELY or not polys:
-        return np.empty((0,2)), np.empty((0,)), 0.0
-    dom = unary_union(polys)
-    minx, miny, maxx, maxy = dom.bounds
-    area_dom = dom.area
-
+# ------------------------------- Particle Packing -----------------------------
+def pack_particles_no_cache(polys_wkb_list, diam_units, phi2D_target, 
+                           max_particles, layer_idx):
+    """
+    Pack particles in polygon domain using RSA algorithm.
+    NOT cached - computes fresh each time to ensure unique particles per layer.
+    
+    Args:
+        polys_wkb_list: List of WKB-encoded polygons
+        diam_units: Array of particle diameters (in mesh units)
+        phi2D_target: Target 2D packing fraction
+        max_particles: Maximum number of particles to place
+        layer_idx: Layer index (used for random seed)
+    
+    Returns:
+        centers: Nx2 array of particle centers
+        radii: N array of particle radii
+        phi2D: Achieved packing fraction
+    """
+    if not HAVE_SHAPELY:
+        raise ImportError("shapely required for particle packing")
+    
+    if not polys_wkb_list:
+        return np.empty((0, 2)), np.empty((0,)), 0.0
+    
+    # Deserialize polygons
+    polys = [wkb.loads(p) for p in polys_wkb_list]
+    dom_all = unary_union(polys)
+    
+    if dom_all.is_empty:
+        return np.empty((0, 2)), np.empty((0,)), 0.0
+    
+    minx, miny, maxx, maxy = dom_all.bounds
+    area_dom = dom_all.area
+    
     diam = np.sort(np.asarray(diam_units))[::-1]
     placed_xy, placed_r = [], []
-    area_circ, target_area = 0.0, float(np.clip(phi_target,0.05,0.90))*area_dom
-    rng = np.random.default_rng(seed)
-
-    cell = max(diam.max()/2.0, (maxx-minx+maxy-miny)/450.0)
-    grid: Dict[Tuple[int,int], List[int]] = {}
-    def _ok(x, y, r):
-        gx, gy = int(x//cell), int(y//cell)
-        for ix in range(gx-1, gx+2):
-            for iy in range(gy-1, gy+2):
+    area_circ = 0.0
+    target_area = float(np.clip(phi2D_target, 0.05, 0.90)) * area_dom
+    
+    # CRITICAL: Unique random seed per layer
+    rng = np.random.default_rng(20_000 + layer_idx)
+    
+    # Spatial grid for fast collision detection
+    cell = max(diam.max() / 2.0, (maxx - minx + maxy - miny) / 400.0)
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    
+    def no_overlap(x, y, r):
+        gx, gy = int(x // cell), int(y // cell)
+        for ix in range(gx - 1, gx + 2):
+            for iy in range(gy - 1, gy + 2):
                 for j in grid.get((ix, iy), []):
                     dx, dy = x - placed_xy[j][0], y - placed_xy[j][1]
                     if dx*dx + dy*dy < (r + placed_r[j])**2:
                         return False
         return True
-
+    
     trials = 0
+    max_trials = 480_000
+    
     for d in diam:
-        r = d/2.0
-        fit = dom.buffer(-r)
-        if getattr(fit,"is_empty",True): continue
-        fx0, fy0, fx1, fy1 = fit.bounds
-        for _ in range(480):
+        r = d / 2.0
+        fit_dom = dom_all.buffer(-r)
+        if getattr(fit_dom, "is_empty", True):
+            continue
+        fminx, fminy, fmaxx, fmaxy = fit_dom.bounds
+        
+        for _ in range(600):
             trials += 1
-            if trials>max_trials or area_circ>=target_area or len(placed_xy)>=max_particles: break
-            x = rng.uniform(fx0, fx1); y = rng.uniform(fy0, fy1)
-            if not fit.contains(Point(x,y)) or not _ok(x,y,r): continue
+            if trials > max_trials or area_circ >= target_area or len(placed_xy) >= max_particles:
+                break
+            
+            x = rng.uniform(fminx, fmaxx)
+            y = rng.uniform(fminy, fmaxy)
+            
+            if not fit_dom.contains(Point(x, y)):
+                continue
+            if not no_overlap(x, y, r):
+                continue
+            
             idx = len(placed_xy)
-            placed_xy.append((x,y)); placed_r.append(r)
-            gx, gy = int(x//cell), int(y//cell)
-            grid.setdefault((gx,gy), []).append(idx)
-            area_circ += math.pi*r*r
-        if trials>max_trials or area_circ>=target_area or len(placed_xy)>=max_particles: break
+            placed_xy.append((x, y))
+            placed_r.append(r)
+            gx, gy = int(x // cell), int(y // cell)
+            grid.setdefault((gx, gy), []).append(idx)
+            area_circ += math.pi * r * r
+        
+        if trials > max_trials or area_circ >= target_area or len(placed_xy) >= max_particles:
+            break
+    
+    centers = np.array(placed_xy) if placed_xy else np.empty((0, 2))
+    radii = np.array(placed_r) if placed_r else np.empty((0,))
+    phi2D = area_circ / area_dom if area_dom > 0 else 0.0
+    
+    return centers, radii, float(phi2D)
 
-    centers = np.array(placed_xy) if placed_xy else np.empty((0,2))
-    radii   = np.array(placed_r)  if placed_r  else np.empty((0,))
-    phi     = area_circ/area_dom if area_dom>0 else 0.0
-    return centers, radii, float(phi)
+# ------------------------------- Rasterization --------------------------------
+@st.cache_data(show_spinner=False)
+def raster_particle_mask(_centers_hash, centers, radii, fov, px=900):
+    """
+    Rasterize particles to binary mask using vectorized numpy.
+    10x faster than PIL-based approach.
+    """
+    y_grid, x_grid = np.mgrid[0:px, 0:px]
+    sx = fov / px
+    x_phys = x_grid * sx
+    y_phys = (px - y_grid) * sx
+    
+    mask = np.zeros((px, px), dtype=bool)
+    for (cx, cy), r in zip(centers, radii):
+        dist_sq = (x_phys - cx)**2 + (y_phys - cy)**2
+        mask |= (dist_sq <= r**2)
+    
+    return mask
 
-def _bitmap_mask(centers, radii, fov, px=900):
-    img=Image.new("L",(px,px),color=0); drw=ImageDraw.Draw(img)
-    sx=px/fov; sy=px/fov
-    for (x,y),r in zip(centers,radii):
-        x0=int((x-r)*sx); y0=int((fov-(y+r))*sy); x1=int((x+r)*sx); y1=int((fov-(y-r))*sy)
-        drw.ellipse([x0,y0,x1,y1], fill=255)
-    return (np.array(img)>0)
-
-def _voids(pore_mask, sat, seed=0):
-    if pore_mask.sum()==0: return np.zeros_like(pore_mask,bool)
-    want = int(round((1.0 - float(sat))*int(pore_mask.sum())))
-    if want<=0: return np.zeros_like(pore_mask,bool)
-    if _HAVE_SCIPY:
+# ------------------------------- Void Generation ------------------------------
+@st.cache_data(show_spinner=False)
+def generate_void_mask(_pore_hash, pore_mask, saturation, seed):
+    """Generate void mask based on binder saturation"""
+    rng = np.random.default_rng(seed)
+    pore = int(pore_mask.sum())
+    if pore <= 0:
+        return np.zeros_like(pore_mask, bool)
+    target = int(round((1.0 - saturation) * pore))
+    if target <= 0:
+        return np.zeros_like(pore_mask, bool)
+    
+    if HAVE_SCIPY:
+        # Distance transform + noise approach
         dist = ndi.distance_transform_edt(pore_mask)
-        noise = ndi.gaussian_filter(np.random.default_rng(seed).standard_normal(pore_mask.shape), sigma=2.0)
-        field = dist + 0.18*noise
-        flat  = field[pore_mask]
-        kth   = np.partition(flat, len(flat)-want)[len(flat)-want]
-        vm    = np.zeros_like(pore_mask,bool); vm[pore_mask]=field[pore_mask]>=kth
-        vm    = ndi.binary_opening(vm, iterations=1); vm = ndi.binary_closing(vm, iterations=1)
+        noise = ndi.gaussian_filter(rng.standard_normal(pore_mask.shape), sigma=2.0)
+        field = dist + 0.18 * noise
+        flat = field[pore_mask]
+        kth = np.partition(flat, len(flat) - target)[len(flat) - target]
+        vm = np.zeros_like(pore_mask, bool)
+        vm[pore_mask] = field[pore_mask] >= kth
+        vm = ndi.binary_opening(vm, iterations=1)
+        vm = ndi.binary_closing(vm, iterations=1)
         return vm
-    # dotted fallback
-    h,w=pore_mask.shape; vm=np.zeros_like(pore_mask,bool); area=0; tries=0
-    rng=np.random.default_rng(seed)
-    while area<want and tries<90000:
-        tries+=1; r=int(np.clip(rng.normal(3.0,1.2),1.0,6.0))
-        x=rng.integers(r,w-r); y=rng.integers(r,h-r)
-        if pore_mask[y,x]:
-            yy,xx=np.ogrid[-y:h-y,-x:w-x]; disk=(xx*xx+yy*yy)<=r*r
-            add=np.logical_and(disk,pore_mask); vm[add]=True; area=int(vm.sum())
+    
+    # Fallback: random dots
+    h, w = pore_mask.shape
+    vm = np.zeros_like(pore_mask, bool)
+    area, tries = 0, 0
+    while area < target and tries < 120000:
+        tries += 1
+        r = int(np.clip(rng.normal(3.0, 1.2), 1.0, 6.0))
+        x = rng.integers(r, w - r)
+        y = rng.integers(r, h - r)
+        if pore_mask[y, x]:
+            yy, xx = np.ogrid[-y:h-y, -x:w-x]
+            disk = (xx*xx + yy*yy) <= r*r
+            add = np.logical_and(disk, pore_mask)
+            vm[add] = True
+            area = int(vm.sum())
     return vm
 
-def _scale(ax, fov_mm, length_um=500):
-    length_mm = length_um/1000.0
-    if length_mm >= fov_mm: return
-    pad = 0.06*fov_mm
-    x0 = fov_mm - pad - length_mm; x1 = fov_mm - pad
-    y = pad*0.6
-    ax.plot([x0,x1],[y,y], lw=3.0, color=_COLOR_BORDER)
-    ax.text((x0+x1)/2, y+0.02*fov_mm, f"{int(length_um)} µm",
-            ha="center", va="bottom", fontsize=9, color=_COLOR_BORDER)
+# ------------------------------- Visualization Helpers ------------------------
+def draw_scale_bar(ax, fov_mm, length_um=500):
+    """Draw scale bar on matplotlib axis"""
+    length_mm = length_um / 1000.0
+    if length_mm >= fov_mm:
+        return
+    pad = 0.06 * fov_mm
+    x0 = fov_mm - pad - length_mm
+    x1 = fov_mm - pad
+    y = pad * 0.6
+    ax.plot([x0, x1], [y, y], lw=3.5, color="#111111")
+    ax.text((x0 + x1) / 2, y + 0.02 * fov_mm, f"{int(length_um)} µm",
+            ha="center", va="bottom", fontsize=9, color="#111111")
 
-# ============================ PUBLIC ENTRY ============================
-def render(material:str, d50_um:float, layer_um:float):
-    # Use st.* only inside this function (i.e., after Streamlit session exists)
-    st.subheader("Digital Twin (Beta) — STL slice + qualitative packing")
-    if not (_HAVE_TRIMESH and _HAVE_SHAPELY):
-        st.error("Install 'trimesh' and 'shapely' (see requirements.txt)."); return
+def render_particles_only(ax, centers, radii, fov):
+    """Render particles-only view"""
+    ax.add_patch(Rectangle((0, 0), fov, fov, facecolor="white", 
+                          edgecolor=BORDER, linewidth=1.2))
+    for (x, y), r in zip(centers, radii):
+        ax.add_patch(Circle((x, y), r, facecolor=PARTICLE, edgecolor=EDGE, linewidth=0.25))
+    ax.set_aspect('equal', 'box')
+    ax.set_xlim(0, fov)
+    ax.set_ylim(0, fov)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    draw_scale_bar(ax, fov)
 
-    top5 = st.session_state.get("top5_recipes_df")
-    if top5 is None or getattr(top5, "empty", True):
-        st.info("Generate recommendations first (click Recommend)."); return
-    top5 = top5.reset_index(drop=True)
+def render_with_binder(ax, centers, radii, pore_mask, saturation, 
+                      binder_hex, fov, seed_offset):
+    """Render particles + binder + voids"""
+    # Generate void mask
+    pore_hash = hash((pore_mask.tobytes(), saturation, seed_offset))
+    vmask = generate_void_mask(pore_hash, pore_mask, saturation, seed_offset)
+    
+    # Background: binder
+    ax.add_patch(Rectangle((0, 0), fov, fov, facecolor=binder_hex, 
+                          edgecolor=BORDER, linewidth=1.2))
+    
+    # Voids (white dots)
+    ys, xs = np.where(vmask)
+    if len(xs):
+        xm = xs * (fov / vmask.shape[1])
+        ym = (vmask.shape[0] - ys) * (fov / vmask.shape[0])
+        ax.scatter(xm, ym, s=0.32, c=VOID, alpha=0.96, linewidth=0)
+    
+    # Particles
+    for (x, y), r in zip(centers, radii):
+        ax.add_patch(Circle((x, y), r, facecolor=PARTICLE, edgecolor=EDGE, linewidth=0.25))
+    
+    ax.set_aspect('equal', 'box')
+    ax.set_xlim(0, fov)
+    ax.set_ylim(0, fov)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    draw_scale_bar(ax, fov)
+    
+    # Legend
+    ax.text(0.02 * fov, 0.97 * fov, "SiC", color=PARTICLE, fontsize=9, va="top")
+    ax.text(0.12 * fov, 0.97 * fov, "Binder", color="#805a00", fontsize=9, va="top")
+    ax.text(0.24 * fov, 0.97 * fov, "Void", color="#666", fontsize=9, va="top")
 
-    L, R = st.columns([1.2, 1])
-    with L:
-        rec_id = st.selectbox("Pick one trial", list(top5["id"]), index=0)
-        picks  = st.multiselect("Compare trials", list(top5["id"]), default=list(top5["id"])[:3])
-    with R:
-        stl_units = st.selectbox("STL units", ["mm","m"], index=0)
-        um2unit = 1e-3 if stl_units=="mm" else 1e-6
-        pack_full = st.checkbox("Pack full slice (auto FOV)", value=True)
-        fov_mm = st.slider("Manual FOV (mm)", 0.5, 6.0, 1.5, 0.05, disabled=pack_full)
-        phi_TPD = st.slider("Target φ_TPD", 0.85, 0.95, 0.90, 0.01)
-        phi2D_target = float(np.clip(0.90*phi_TPD, 0.40, 0.88))
-        cap = st.slider("Visual cap (particles)", 200, 3000, 1500, 50)
-        fast = st.toggle("Fast mode (coarser packing)", value=True)
-
-    c1,c2,c3 = st.columns([2,1,1])
-    with c1: stl_file = st.file_uploader("Upload STL", type=["stl"])
-    with c2: use_cube = st.checkbox("Use built-in 10 mm cube", value=False)
-    with c3: show_mesh = st.checkbox("Show 3D mesh preview", value=True)
-
-    mesh=None
-    if use_cube:
-        mesh = trimesh.creation.box(extents=(10.0,10.0,10.0))
-    elif stl_file is not None:
-        try:
-            mesh = _load_mesh_from_bytes(stl_file.read())
-        except Exception as e:
-            st.error(f"Failed to read STL: {e}")
-            return
-
-    rec = top5[top5["id"]==rec_id].iloc[0]
-    d50_r = float(rec.get("d50_um",  d50_um))
-    layer_r = float(rec.get("layer_um", layer_um))
-    diam_um = _psd_um(7000 if fast else 10000, d50_r, seed=9991)
-    diam_units = diam_um * um2unit
-
-    if mesh is not None:
-        minz, maxz = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
-        thickness = layer_r * (1e-3 if stl_units=="mm" else 1e-6)
-        n_layers = max(1, int((maxz - minz) / max(thickness, 1e-12)))
-        st.caption(f"Layers: {n_layers} · Z span: {maxz-minz:.3f} {stl_units}")
-        layer_idx = st.slider("Layer index", 1, n_layers, min(5, n_layers))
-        z = minz + (layer_idx - 0.5) * thickness
-    else:
-        n_layers, layer_idx, z = 1, 1, 0.0
-
-    if mesh is not None and show_mesh:
-        import plotly.graph_objects as go
-        figm = go.Figure(data=[go.Mesh3d(
-            x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
-            i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
-            color="lightgray", opacity=0.55, flatshading=True, name="Part"
-        )]).update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=0,b=0), height=360)
-        st.plotly_chart(figm, use_container_width=True)
-
-    # Build slice area (fall back to centered square if no STL)
-    if mesh is not None and _HAVE_SHAPELY:
-        polys_world = _slice_polys(mesh, z)
-        if pack_full and polys_world:
-            dom = unary_union(polys_world)
-            xmin, ymin, xmax, ymax = dom.bounds
-            fov = max(xmax-xmin, ymax-ymin)
-            win = box(xmin, ymin, xmin+fov, ymin+fov)
-            polys_clip = [dom.intersection(win)]
-            polys_local = _to_local(polys_clip, (xmin, ymin))
-            render_fov = fov
-        else:
-            polys_clip, origin = _crop_to_fov(polys_world, float(fov_mm))
-            polys_local = _to_local(polys_clip, origin)
-            render_fov = float(fov_mm)
-    else:
-        half = (1.8)/2.0
-        polys_local=[box(0,0,2*half,2*half)]
-        render_fov = 2*half
-
-    centers, radii, phi2D = _pack(
-        polys_local, diam_units, phi2D_target,
-        max_particles=int(cap),
-        max_trials=200_000 if fast else 480_000,
-        seed=20_000 + int(0 if mesh is None else layer_idx)
-    )
-
-    def _panel_particles(ax):
-        ax.add_patch(Rectangle((0,0), render_fov, render_fov, facecolor="white", edgecolor=_COLOR_BORDER, linewidth=1.2))
-        for (x,y), r in zip(centers, radii):
-            ax.add_patch(Circle((x,y), r, facecolor=_COLOR_PARTICLE, edgecolor=_COLOR_EDGE, linewidth=0.25))
-        ax.set_aspect('equal','box'); ax.set_xlim(0,render_fov); ax.set_ylim(0,render_fov); ax.set_xticks([]); ax.set_yticks([])
-
-    def _panel_binder(ax, sat_pct, binder):
-        px=900; pores=~_bitmap_mask(centers, radii, render_fov, px)
-        vm = _voids(pores, sat=float(sat_pct)/100.0, seed=1234)
-        ax.add_patch(Rectangle((0,0), render_fov, render_fov, facecolor=_binder_hex(binder), edgecolor=_COLOR_BORDER, linewidth=1.2))
-        ys,xs=np.where(vm)
-        if len(xs):
-            xm=xs*(render_fov/vm.shape[1]); ym=(vm.shape[0]-ys)*(render_fov/vm.shape[0])
-            ax.scatter(xm, ym, s=0.32, c=_COLOR_VOID, alpha=0.96, linewidth=0)
-        for (x,y), r in zip(centers, radii):
-            ax.add_patch(Circle((x,y), r, facecolor=_COLOR_PARTICLE, edgecolor=_COLOR_EDGE, linewidth=0.25))
-        ax.set_aspect('equal','box'); ax.set_xlim(0,render_fov); ax.set_ylim(0,render_fov); ax.set_xticks([]); ax.set_yticks([])
-
-    rec = top5[top5["id"]==rec_id].iloc[0]
-    sat_pct = float(rec.get("saturation_pct", 85.0))
-    binder  = str(rec.get("binder_type","water_based"))
-
-    cA,cB = st.columns(2)
-    with cA:
-        figA, axA = plt.subplots(figsize=(5.1,5.1), dpi=185)
-        _panel_particles(axA); _scale(axA, render_fov); axA.set_title("Particles only", fontsize=10)
-        st.pyplot(figA, use_container_width=True)
-    with cB:
-        figB, axB = plt.subplots(figsize=(5.1,5.1), dpi=185)
-        _panel_binder(axB, sat_pct, binder); _scale(axB, render_fov); axB.set_title(f"{binder} · Sat {int(sat_pct)}%", fontsize=10)
-        st.pyplot(figB, use_container_width=True)
-
-    st.caption(f"FOV={render_fov:.2f} mm · φ₂D(target)≈{phi2D_target:.2f} · φ₂D(achieved)≈{min(phi2D,1.0):.2f} · Porosity₂D≈{max(0.0,1.0-phi2D):.2f}")
-
-    if picks:
-        cols = st.columns(min(3, len(picks)))
-        for i, rid in enumerate(picks[:len(cols)]):
-            row = top5[top5["id"]==rid].iloc[0]
-            sat = float(row.get("saturation_pct", 85.0)); bndr=str(row.get("binder_type","water_based"))
-            figC, axC = plt.subplots(figsize=(4.9,4.9), dpi=185)
-            _panel_binder(axC, sat, bndr); _scale(axC, render_fov)
-            axC.set_title(f'{row["id"]}: {bndr} · Sat {int(sat)}%', fontsize=9)
-            with cols[i]: st.pyplot(figC, use_container_width=True)
+# ------------------------------- Capability Checks ----------------------------
+def check_dependencies():
+    """Check if required dependencies are available"""
+    missing = []
+    if not HAVE_TRIMESH:
+        missing.append("trimesh")
+    if not HAVE_SHAPELY:
+        missing.append("shapely")
+    if not HAVE_SCIPY:
+        missing.append("scipy (optional, but recommended)")
+    return missing
